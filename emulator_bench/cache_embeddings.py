@@ -18,28 +18,32 @@ from emulator_bench.common import (
 from emulator_bench.feature_pipeline import (
     BACPIFeaturizer,
     compound_cache_path,
+    PackedCache,
     featurizer_path,
     filter_invalid_smiles_rows,
+    pack_cache,
+    packed_dir,
     protein_cache_path,
     save_npz_atomic,
 )
 
 
-def collect_unique_values(jobs, sequence_col: str, smiles_col: str):
+def collect_unique_values(jobs, sequence_col: str, smiles_col: str, packed=None):
     """Unique SMILES and sequences over all split files. Rows with invalid SMILES are skipped in memory only."""
     sequences, smiles_values = set(), set()
     for job in jobs:
         for key in ("train_path", "val_path", "test_path"):
             frame = read_table(Path(job[key]))
             require_columns(frame, [sequence_col, smiles_col], Path(job[key]))
-            frame, _ = filter_invalid_smiles_rows(frame, smiles_col=smiles_col, source_name=job[key])
+            frame, _ = filter_invalid_smiles_rows(frame, smiles_col=smiles_col, source_name=job[key], packed=packed)
             sequences.update(frame[sequence_col].astype(str))
             smiles_values.update(frame[smiles_col].astype(str))
     return sorted(smiles_values), sorted(sequences)
 
 
 def build_cache(jobs, embeddings_dir: Path, sequence_col: str = "sequence", smiles_col: str = "smiles", datasets_root=None) -> None:
-    smiles_values, sequences = collect_unique_values(jobs, sequence_col, smiles_col)
+    packed = PackedCache(embeddings_dir, "compounds") if (packed_dir(embeddings_dir) / "compounds.index.npz").exists() else None
+    smiles_values, sequences = collect_unique_values(jobs, sequence_col, smiles_col, packed)
     print("Split jobs: %s | unique compounds: %s | unique proteins: %s" % (len(jobs), len(smiles_values), len(sequences)), flush=True)
 
     vocab_path = featurizer_path(embeddings_dir)
@@ -52,11 +56,12 @@ def build_cache(jobs, embeddings_dir: Path, sequence_col: str = "sequence", smil
             for task in TASK_PARENTS
             for job in discover_split_jobs(task_split_dir(task, datasets_root), DEFAULT_SPLIT_GROUPS)
         ]
-        vocab_smiles, vocab_sequences = collect_unique_values(vocab_jobs, sequence_col, smiles_col)
+        vocab_smiles, vocab_sequences = collect_unique_values(vocab_jobs, sequence_col, smiles_col, packed)
         featurizer = BACPIFeaturizer()
         featurizer.build_from_values(vocab_smiles, vocab_sequences)
         featurizer.save(vocab_path)
 
+    added = False
     for values, path_fn, encode in (
         (smiles_values, compound_cache_path, featurizer.encode_compound),
         (sequences, protein_cache_path, featurizer.encode_protein),
@@ -65,7 +70,10 @@ def build_cache(jobs, embeddings_dir: Path, sequence_col: str = "sequence", smil
         print("Missing cache entries: %s of %s" % (len(pending), len(values)), flush=True)
         for value in pending:
             save_npz_atomic(path_fn(embeddings_dir, value), encode(value))
+            added = True
 
+    if added or packed is None:
+        pack_cache(embeddings_dir)
 
 
 def main():

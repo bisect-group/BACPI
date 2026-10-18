@@ -35,6 +35,7 @@ Compound features: RDKit graph fingerprint ids and a 1024-bit Morgan fingerprint
 Protein features: amino-acid 3-grams.
 
 Seeds: 666, 777, 888.
+The train loader uses `--num_workers`. The validation and test loaders use at most 2 workers.
 
 ## Scripts
 
@@ -45,13 +46,17 @@ Seeds: 666, 777, 888.
   `--amp` turns on mixed precision (bf16, or fp16 on pre-Ampere GPUs). Default is fp32.
 - `aggregate_retrain_metrics.py`: writes `summary_runs.csv` and `summary.csv` (mean and std over seeds).
 - `predict_single_target.py`: evaluates a saved `bestmodel.pth` on one split file.
-- `model_v2.py`, `modeling_v2.py`: memory-efficient BACPI. It gives the same outputs as `code/model.py`.
+- `model_v2.py`, `modeling_v2.py`: memory-efficient BACPI. It gives the same outputs as `code/model.py` up to float rounding.
+  The protein convolutions run as banded matrix products (cuDNN above length 8192). Training uses fused Adam on CUDA.
 
 ## Output layout
 
 Default `--out_root`: `outputs/baselines/BACPI`.
 
 - `embeddings/`: feature cache `compounds_v2/`, `proteins_v2/` and the frozen vocabulary `vocabs_v2/`.
+  `packed_v2/` holds the same entries as flat memory-mapped files. Training and prediction read only these files.
+  `cache_embeddings.py` rebuilds `packed_v2/` after it adds entries. It also builds it for a cache that has only npz files, so run it once on such a cache.
+  Valid SMILES have entries in `packed_v2/`, so later runs parse only SMILES that are not in it.
   Cache keys cover the featurizer settings. Change `CACHE_VERSION` in `feature_pipeline.py` to force a rebuild.
 - `<task>/<split_group>/<split_name>/seed_<seed>/`: `bestmodel.pth`, `logfile.csv`,
   `final_results_{train,val,test}.csv` (rmse, mae, r2_score, pearson, spearman),

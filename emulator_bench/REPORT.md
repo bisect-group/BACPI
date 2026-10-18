@@ -58,6 +58,15 @@ Original `code/` is not touched.
 - Invalid-SMILES rows are dropped in memory per split. The counts are saved in `run_summary.json` as `rows_dropped_invalid_smiles` (train, val, test).
 - Seed handling: the original split train into train/dev inside `main.py` and used the dataset's own test. Here the three split files come from EMULaToR.
 
+## Speed-ups
+- Protein convolutions: each single-channel 11 x 11 conv in `BACPIv2.prot_cnn` runs as banded matrices and one `addmm` on an unfolded tensor (`banded_conv`). Above length 8192 the model uses the cuDNN conv. Parameters and `state_dict` keys are unchanged, so old checkpoints load.
+- Optimiser: Adam uses `fused=True` on CUDA.
+- Both changes are numerically equivalent but not bit-identical to the original conv and Adam. They change the order of float operations. Adam amplifies this over many steps.
+- The original run is itself not reproducible run to run in default mode (cuDNN and atomic-add kernels). Two identical runs give different losses.
+- Features: `packed_v2/` stores all cache entries in flat memory-mapped files. Processes share them through the page cache, so each process no longer loads every npz entry. Batch tensors are bitwise equal to the npz loader, in the same order. Run `cache_embeddings.py` once on a cache that has only npz files to build the pack.
+- SMILES validity: SMILES with a packed entry are valid and are not parsed again. Others still go to RDKit. The kept rows are identical.
+- Validation and test loaders use at most 2 workers. The train loader and its shuffle order are unchanged.
+
 ## Commands
 Run from `baselines/BACPI` with the mldb env.
 ```

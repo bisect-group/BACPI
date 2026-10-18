@@ -1,29 +1,14 @@
-from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from emulator_bench.feature_pipeline import load_npz_payload
-
-
-class CacheStore:
-    """Loads cached npz payloads on first use."""
-
-    def __init__(self, path_fn):
-        self._path_fn = path_fn
-        self._cache: Dict[Path, Dict] = {}
-
-    def get(self, value: str) -> Dict:
-        path = self._path_fn(value)
-        if path not in self._cache:
-            self._cache[path] = load_npz_payload(path)
-        return self._cache[path]
+from emulator_bench.feature_pipeline import PackedCache, compound_cache_key, protein_cache_key
 
 
 class BACPIDataset(Dataset):
-    def __init__(self, frame, compound_store: CacheStore, protein_store: CacheStore, smiles_col: str, sequence_col: str, target_col: str):
+    def __init__(self, frame, compounds: PackedCache, proteins: PackedCache, smiles_col: str, sequence_col: str, target_col: str):
         self.frame = frame.reset_index(drop=True)
 
         # Pull hot-path data into plain Python lists so __getitem__ never touches pandas
@@ -31,22 +16,18 @@ class BACPIDataset(Dataset):
         self._sequence_list: List[str] = self.frame[sequence_col].astype(str).tolist()
         self._targets: List[float] = self.frame[target_col].tolist()
 
-        # Pre-resolve cache references per row; avoids a hash + dict lookup on every __getitem__
-        # call. Duplicate SMILES/sequences share the same dict object (no extra memory cost).
-        self._compound_items: List[Dict] = [compound_store.get(s) for s in self._smiles_list]
-        self._protein_items: List[Dict] = [protein_store.get(s) for s in self._sequence_list]
+        # Features stay in the shared memory-mapped pack. Each row only stores its pack row numbers.
+        self._compounds, self._proteins = compounds, proteins
+        self._compound_rows = compounds.rows(self._smiles_list, compound_cache_key)
+        self._protein_rows = proteins.rows(self._sequence_list, protein_cache_key)
 
     def __len__(self):
         return len(self._targets)
 
     def __getitem__(self, index):
-        ci = self._compound_items[index]
-        pi = self._protein_items[index]
         return {
-            "compounds": ci["compounds"],
-            "adjacencies": ci["adjacencies"],
-            "fingerprint": ci["fingerprint"],
-            "proteins": pi["proteins"],
+            **self._compounds.compound(self._compound_rows[index]),
+            "proteins": self._proteins.tokens(self._protein_rows[index]),
             "target": self._targets[index],
         }
 

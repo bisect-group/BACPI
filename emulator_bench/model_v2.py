@@ -24,6 +24,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+MAX_BANDED_LENGTH = 8192
+
+
+def banded_conv(x: torch.Tensor, conv: nn.Conv2d) -> torch.Tensor:
+    """Same result as the 1-channel conv `conv(x)` on [B, 1, L, D], as one matmul.
+
+    cuDNN is slow for a single channel. Each kernel row becomes a banded D x D matrix.
+    """
+    B, _, L, D = x.shape
+    k = conv.kernel_size[0]
+    r = k // 2
+    j = torch.arange(D, device=x.device)
+    off = j[:, None] - j[None, :] + r
+    bands = torch.where((off >= 0) & (off < k), conv.weight.view(k, k)[:, off.clamp(0, k - 1)], 0.0)
+    rows = F.pad(x.squeeze(1), (0, 0, r, r)).unfold(1, k, 1).permute(0, 1, 3, 2).reshape(B * L, k * D)
+    return torch.addmm(conv.bias, rows, bands.reshape(k * D, D)).view(B, 1, L, D)
+
+
 class GATLayerV2(nn.Module):
     """Graph Attention Layer using broadcast-based attention scoring.
 
@@ -154,8 +172,10 @@ class BACPIv2(nn.Module):
     def prot_cnn(self, amino: torch.Tensor, amino_mask: torch.Tensor) -> torch.Tensor:
         amino_vector = self.embedding_layer_amino(amino)
         amino_vector = amino_vector.unsqueeze(1)  # [B, 1, L, D]
+        # Above this length the unfolded matrix costs too much memory, so cuDNN runs the conv.
+        use_banded = amino_vector.shape[2] <= MAX_BANDED_LENGTH
         for conv in self.conv_layers:
-            amino_vector = F.leaky_relu(conv(amino_vector), self.alpha)
+            amino_vector = F.leaky_relu(banded_conv(amino_vector, conv) if use_banded else conv(amino_vector), self.alpha)
         amino_vector = amino_vector.squeeze(1)    # [B, L, D]
         amino_vector = F.leaky_relu(self.W_prot(amino_vector), self.alpha)
         return amino_vector

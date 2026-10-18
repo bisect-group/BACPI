@@ -14,8 +14,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import append_csv_row, read_table, regression_metrics, require_columns, resolve_amp_dtype, save_json, set_seed
-from emulator_bench.dataset import BACPIDataset, CacheStore, create_loader
-from emulator_bench.feature_pipeline import BACPIFeaturizer, compound_cache_path, featurizer_path, filter_invalid_smiles_rows, protein_cache_path
+from emulator_bench.dataset import BACPIDataset, create_loader
+from emulator_bench.feature_pipeline import BACPIFeaturizer, PackedCache, compound_cache_key, featurizer_path, filter_invalid_smiles_rows, protein_cache_key
 from emulator_bench.modeling_v2 import BACPIModelConfig, build_model
 
 
@@ -75,25 +75,25 @@ def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=Non
     return total_loss / max(1, total_samples)
 
 
-def ensure_split_cache(embeddings_dir: Path, frame: pd.DataFrame, smiles_col: str, sequence_col: str):
-    for values, path_fn, kind in (
-        (frame[smiles_col].astype(str).unique(), compound_cache_path, "compound"),
-        (frame[sequence_col].astype(str).unique(), protein_cache_path, "protein"),
+def ensure_split_cache(compounds: PackedCache, proteins: PackedCache, frame: pd.DataFrame, smiles_col: str, sequence_col: str):
+    for values, packed, key_fn, kind in (
+        (frame[smiles_col].astype(str).unique(), compounds, compound_cache_key, "compound"),
+        (frame[sequence_col].astype(str).unique(), proteins, protein_cache_key, "protein"),
     ):
-        missing = [value for value in values if not path_fn(embeddings_dir, value).exists()]
+        missing = [value for value in values if key_fn(value) not in packed.index]
         if missing:
             raise FileNotFoundError(
-                "%s %s caches are missing in %s. Run emulator_bench/cache_embeddings.py first."
-                % (len(missing), kind, embeddings_dir)
+                "%s %s caches are missing from the packed cache. Run emulator_bench/cache_embeddings.py first."
+                % (len(missing), kind)
             )
 
 
-def prepare_split_frame(split_path: Path, args):
+def prepare_split_frame(split_path: Path, args, compounds: PackedCache):
     frame = read_table(split_path)
     require_columns(frame, [args.sequence_col, args.smiles_col, args.target_col], split_path)
     rows_dropped = 0
     if not args.skip_smiles_validity_check:
-        frame, stats = filter_invalid_smiles_rows(frame, smiles_col=args.smiles_col, source_name=str(split_path))
+        frame, stats = filter_invalid_smiles_rows(frame, smiles_col=args.smiles_col, source_name=str(split_path), packed=compounds)
         rows_dropped = stats["rows_dropped"]
         if rows_dropped:
             print("Dropped %s rows with invalid SMILES from %s (file unchanged)" % (rows_dropped, split_path), flush=True)
@@ -146,22 +146,21 @@ def main():
     scaler = torch.amp.GradScaler("cuda") if amp_dtype == torch.float16 else None
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    prepared = {name: prepare_split_frame(getattr(args, "%s_path" % name), args) for name in ("train", "val", "test")}
+    compounds, proteins = PackedCache(args.embeddings_dir, "compounds"), PackedCache(args.embeddings_dir, "proteins")
+    prepared = {name: prepare_split_frame(getattr(args, "%s_path" % name), args, compounds) for name in ("train", "val", "test")}
     frames = {name: frame for name, (frame, _) in prepared.items()}
     rows_dropped_invalid_smiles = {name: dropped for name, (_, dropped) in prepared.items()}
     for frame in frames.values():
-        ensure_split_cache(args.embeddings_dir, frame, args.smiles_col, args.sequence_col)
+        ensure_split_cache(compounds, proteins, frame, args.smiles_col, args.sequence_col)
     featurizer = BACPIFeaturizer.load(featurizer_path(args.embeddings_dir))
 
-    compound_store = CacheStore(lambda smiles: compound_cache_path(args.embeddings_dir, smiles))
-    protein_store = CacheStore(lambda sequence: protein_cache_path(args.embeddings_dir, sequence))
     pin_memory = device.type == "cuda"
     loaders = {
         name: create_loader(
-            BACPIDataset(frame, compound_store, protein_store, args.smiles_col, args.sequence_col, args.target_col),
+            BACPIDataset(frame, compounds, proteins, args.smiles_col, args.sequence_col, args.target_col),
             batch_size=args.batch_size,
             shuffle=(name == "train"),
-            num_workers=args.num_workers,
+            num_workers=args.num_workers if name == "train" else min(2, args.num_workers),
             pin_memory=pin_memory,
             seed=args.seed,
         )
@@ -174,7 +173,7 @@ def main():
         **{key: getattr(args, key) for key in BACPIModelConfig.__dataclass_fields__}
     )
     model = build_model(featurizer.n_atom_tokens, featurizer.n_amino_tokens, config).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0, amsgrad=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0, amsgrad=True, fused=device.type == "cuda")
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
 
     started = time.time()

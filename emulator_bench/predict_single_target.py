@@ -10,8 +10,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bench.common import read_table, require_columns
-from emulator_bench.dataset import BACPIDataset, CacheStore, create_loader
-from emulator_bench.feature_pipeline import BACPIFeaturizer, compound_cache_path, featurizer_path, filter_invalid_smiles_rows, protein_cache_path
+from emulator_bench.dataset import BACPIDataset, create_loader
+from emulator_bench.feature_pipeline import BACPIFeaturizer, PackedCache, featurizer_path, filter_invalid_smiles_rows
 from emulator_bench.modeling_v2 import BACPIModelConfig, build_model
 from emulator_bench.train_single_target_tvt import evaluate_loader
 
@@ -35,12 +35,13 @@ def main():
     featurizer = BACPIFeaturizer.load(featurizer_path(args.embeddings_dir))
     frame = read_table(args.split_path)
     require_columns(frame, [args.sequence_col, args.smiles_col, args.target_col], args.split_path)
-    frame, _ = filter_invalid_smiles_rows(frame, smiles_col=args.smiles_col, source_name=str(args.split_path))
+    compounds, proteins = PackedCache(args.embeddings_dir, "compounds"), PackedCache(args.embeddings_dir, "proteins")
+    frame, _ = filter_invalid_smiles_rows(frame, smiles_col=args.smiles_col, source_name=str(args.split_path), packed=compounds)
 
     dataset = BACPIDataset(
         frame,
-        CacheStore(lambda smiles: compound_cache_path(args.embeddings_dir, smiles)),
-        CacheStore(lambda sequence: protein_cache_path(args.embeddings_dir, sequence)),
+        compounds,
+        proteins,
         args.smiles_col,
         args.sequence_col,
         args.target_col,

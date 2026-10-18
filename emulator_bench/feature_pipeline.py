@@ -1,4 +1,5 @@
 import pickle
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
@@ -41,13 +42,14 @@ def parse_smiles(smiles: str):
     return Chem.MolFromSmiles(normalize_smiles_text(smiles))
 
 
-def filter_invalid_smiles_rows(frame: pd.DataFrame, smiles_col: str, source_name: str = ""):
+def filter_invalid_smiles_rows(frame: pd.DataFrame, smiles_col: str, source_name: str = "", packed: Optional["PackedCache"] = None):
+    """Drop rows whose SMILES RDKit cannot parse. SMILES in the packed compound cache are valid, so they are not parsed."""
     cache = {}
     mask = []
     invalid_examples = []
     for smiles in frame[smiles_col].astype(str).tolist():
         if smiles not in cache:
-            cache[smiles] = parse_smiles(smiles) is not None
+            cache[smiles] = (packed is not None and compound_cache_key(smiles) in packed.index) or parse_smiles(smiles) is not None
         is_valid = cache[smiles]
         mask.append(is_valid)
         if not is_valid and len(invalid_examples) < 5:
@@ -86,6 +88,10 @@ def compound_cache_path(embeddings_dir: Path, smiles: str) -> Path:
 def protein_cache_path(embeddings_dir: Path, sequence: str) -> Path:
     key = protein_cache_key(sequence)
     return Path(embeddings_dir) / ("proteins_v%s" % CACHE_VERSION) / key[:2] / ("%s.npz" % key)
+
+
+def packed_dir(embeddings_dir: Path) -> Path:
+    return Path(embeddings_dir) / ("packed_v%s" % CACHE_VERSION)
 
 
 def save_npz_atomic(path: Path, payload: Dict) -> None:
@@ -267,3 +273,68 @@ class BACPIFeaturizer:
 def load_npz_payload(path: Path) -> Dict:
     with np.load(path, allow_pickle=False) as payload:
         return {key: payload[key] for key in payload.files}
+
+
+def pack_cache(embeddings_dir: Path) -> None:
+    """Pack every cached npz entry into flat binary files that processes share through the page cache.
+
+    Compounds use tokens (int32), adjacencies (uint8, n x n) and fingerprints (uint8). Proteins use tokens.
+    Only valid SMILES have npz entries, so the compound index doubles as the validity record.
+    """
+    out = packed_dir(embeddings_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    for kind, fields in (("compounds", ("compounds", "adjacencies", "fingerprint")), ("proteins", ("proteins",))):
+        paths = sorted((Path(embeddings_dir) / ("%s_v%s" % (kind, CACHE_VERSION))).glob("*/*.npz"))
+        names = ("tokens", "adj", "fp")[: len(fields)]
+        offsets = {name: [0] for name in names[:2]}
+        with ExitStack() as stack:
+            handles = [stack.enter_context(open(out / ("%s.%s.bin.tmp" % (kind, name)), "wb")) for name in names]
+            for path in progress(paths, desc="Packing %s" % kind, unit="entry"):
+                payload = load_npz_payload(path)
+                for name, field, handle in zip(names, fields, handles):
+                    handle.write(np.ascontiguousarray(payload[field]).tobytes())
+                    if name in offsets:
+                        offsets[name].append(offsets[name][-1] + payload[field].size)
+        for name in names:
+            (out / ("%s.%s.bin.tmp" % (kind, name))).replace(out / ("%s.%s.bin" % (kind, name)))
+        tmp_index = out / ("%s.index.tmp.npz" % kind)
+        np.savez(
+            tmp_index,
+            keys=np.asarray([path.stem for path in paths]),
+            **{"%s_offsets" % name: np.asarray(values, dtype=np.int64) for name, values in offsets.items()},
+        )
+        tmp_index.replace(out / ("%s.index.npz" % kind))
+
+
+class PackedCache:
+    """Read-only view of the packed cache of one kind. Entries come from `pack_cache`."""
+
+    def __init__(self, embeddings_dir: Path, kind: str):
+        directory = packed_dir(embeddings_dir)
+        if not (directory / ("%s.index.npz" % kind)).exists():
+            raise FileNotFoundError("No packed %s cache in %s. Run emulator_bench/cache_embeddings.py." % (kind, directory))
+        with np.load(directory / ("%s.index.npz" % kind)) as payload:
+            self.index = {key: row for row, key in enumerate(payload["keys"].tolist())}
+            self._token_offsets = payload["tokens_offsets"]
+            self._adj_offsets = payload["adj_offsets"] if "adj_offsets" in payload.files else None
+        self._tokens = np.memmap(directory / ("%s.tokens.bin" % kind), dtype=np.int32, mode="r")
+        if self._adj_offsets is not None:
+            self._adj = np.memmap(directory / ("%s.adj.bin" % kind), dtype=np.uint8, mode="r")
+            self._fp = np.memmap(directory / ("%s.fp.bin" % kind), dtype=np.uint8, mode="r").reshape(-1, DEFAULT_NBITS)
+
+    def rows(self, values, key_fn) -> list:
+        unique = {value: self.index[key_fn(value)] for value in set(values)}
+        return [unique[value] for value in values]
+
+    def tokens(self, row: int) -> np.ndarray:
+        return self._tokens[self._token_offsets[row] : self._token_offsets[row + 1]]
+
+    def compound(self, row: int) -> Dict:
+        tokens = self.tokens(row)
+        size = tokens.shape[0]
+        start = self._adj_offsets[row]
+        return {
+            "compounds": tokens,
+            "adjacencies": self._adj[start : start + size * size].reshape(size, size),
+            "fingerprint": self._fp[row],
+        }
