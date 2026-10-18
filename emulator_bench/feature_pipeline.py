@@ -35,19 +35,9 @@ def normalize_smiles_text(smiles: str) -> str:
     return str(smiles).strip()
 
 
-def try_canonicalize_smiles(smiles: str):
-    raw = normalize_smiles_text(smiles)
-    mol = Chem.MolFromSmiles(raw)
-    if mol is None:
-        return None
-    return Chem.MolToSmiles(mol, canonical=True)
-
-
-def canonicalize_smiles(smiles: str) -> str:
-    canonical = try_canonicalize_smiles(smiles)
-    if canonical is None:
-        raise ValueError("Invalid SMILES: %s" % normalize_smiles_text(smiles))
-    return canonical
+def parse_smiles(smiles: str):
+    """RDKit mol from the SMILES exactly as given (whitespace stripped), or None if invalid."""
+    return Chem.MolFromSmiles(normalize_smiles_text(smiles))
 
 
 def filter_invalid_smiles_rows(frame: pd.DataFrame, smiles_col: str, source_name: str = ""):
@@ -56,7 +46,7 @@ def filter_invalid_smiles_rows(frame: pd.DataFrame, smiles_col: str, source_name
     invalid_examples = []
     for smiles in frame[smiles_col].astype(str).tolist():
         if smiles not in cache:
-            cache[smiles] = try_canonicalize_smiles(smiles) is not None
+            cache[smiles] = parse_smiles(smiles) is not None
         is_valid = cache[smiles]
         mask.append(is_valid)
         if not is_valid and len(invalid_examples) < 5:
@@ -202,8 +192,10 @@ class BACPIFeaturizer:
         return np.asarray(words, dtype=np.int32)
 
     def encode_compound(self, smiles: str, build: bool = False) -> Dict:
-        canonical = canonicalize_smiles(smiles)
-        mol = Chem.AddHs(Chem.MolFromSmiles(canonical))
+        mol = parse_smiles(smiles)
+        if mol is None:
+            raise ValueError("Invalid SMILES: %s" % normalize_smiles_text(smiles))
+        mol = Chem.AddHs(mol)
         atoms = self._create_atoms(mol, build=build)
         i_jbond_dict = self._create_ijbonddict(mol, build=build)
         compound_tokens = self._atom_features(atoms, i_jbond_dict, build=build)
@@ -212,7 +204,6 @@ class BACPIFeaturizer:
             "adjacencies": self._create_adjacency(mol).astype(np.uint8),
             "fingerprint": self._fingerprint_bits(mol).astype(np.uint8),
             "compound_length": np.asarray([int(compound_tokens.shape[0])], dtype=np.int32),
-            "canonical_smiles": np.asarray([canonical]),
         }
 
     def encode_protein(self, sequence: str, build: bool = False) -> Dict:
@@ -225,16 +216,11 @@ class BACPIFeaturizer:
         }
 
     def build_from_values(self, smiles_values: Iterable[str], sequence_values: Iterable[str]) -> None:
-        smiles_values = list(smiles_values)
-        sequence_values = list(sequence_values)
-        canonical_smiles = []
-        for value in progress(smiles_values, desc="Canonicalizing compounds for vocab", unit="compound"):
-            canonical = try_canonicalize_smiles(value)
-            if canonical is not None:
-                canonical_smiles.append(canonical)
-        unique_canonical_smiles = sorted(set(canonical_smiles))
-        for smiles in progress(unique_canonical_smiles, desc="Building compound vocabulary", unit="compound"):
-            self.encode_compound(smiles, build=True)
+        """Assign ids in first-encounter order like the original dictionaries, over sorted unique inputs."""
+        unique_smiles = sorted({normalize_smiles_text(value) for value in smiles_values})
+        for smiles in progress(unique_smiles, desc="Building compound vocabulary", unit="compound"):
+            if parse_smiles(smiles) is not None:
+                self.encode_compound(smiles, build=True)
         unique_sequences = sorted({normalize_sequence(value) for value in sequence_values})
         for sequence in progress(unique_sequences, desc="Building protein vocabulary", unit="protein"):
             self.encode_protein(sequence, build=True)

@@ -1,18 +1,6 @@
-"""
-Drop-in replacement for emulator_bench/modeling.py using BACPIv2.
+"""Builds BACPIv2, the memory-efficient equivalent of the original BACPI model (code/model.py)."""
 
-To switch the training script to the optimized model, change:
-  from emulator_bench.modeling   import BACPIModelConfig, build_model
-to:
-  from emulator_bench.modeling_v2 import BACPIModelConfig, build_model
-
-No other changes needed in train_single_target_tvt.py or tune_optuna.py.
-
-Also exported: convert_v1_state_dict — converts an original BACPI checkpoint
-to BACPIv2 weight format if you want to resume from an existing run.
-"""
-
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from types import SimpleNamespace
 
 from emulator_bench.model_v2 import BACPIv2, convert_v1_state_dict

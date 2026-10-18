@@ -28,7 +28,7 @@
   - `smiles_hash` can exist in EMULaToR files but is not required
 - Any assumptions about train, validation, and test partitioning:
   - The bench will require explicit `train`, `val`, and `test` split files
-  - The split tree follows `~/github/EMULaToR/data/processed/baselines/BACPI/<value_type>/<split_group>/...`
+  - The split tree follows `~/github/EMULaToR/data/processed/datasets/{kinetic_dataset/ki,binding_affinity_dataset/<kd|ic50|ec50>}/<split_group>/...`
 
 ## 3. Featurization and Preprocessing Path
 
@@ -45,14 +45,13 @@
   - Cached per-unique compound feature files
   - Cached per-unique protein feature files
 - Where cached features will be stored:
-  - `~/github/EMULaToR/data/processed/baselines/BACPI/<value_type>/embeddings/`
+  - `~/github/EMULaToR/data/processed/baselines/BACPI/embeddings/`
   - `embeddings/compounds/<hash-prefix>/<hash>.npz`
   - `embeddings/proteins/<hash-prefix>/<hash>.npz`
   - `embeddings/vocabs/featurizer.pkl`
   - `embeddings/manifest.json`
 - Cache format for train, validation, and test:
   - The bench will cache unique compounds and proteins once globally per `value_type`
-  - Split files will be read directly and mapped to cached keys at runtime so no repeated RDKit or sequence tokenization happens across train, validation, test, Optuna trials, or parallel retrains
 
 ## 4. Training and Evaluation Entrypoints
 
@@ -86,12 +85,12 @@
 
 ## 5. Dataset and Split Mapping
 
-- User dataset path: `~/github/EMULaToR/data/processed/baselines/BACPI/<value_type>`
+- User dataset path: `~/github/EMULaToR/data/processed/datasets/{kinetic_dataset/ki,binding_affinity_dataset/<kd|ic50|ec50>}`
 - User split definition path or files:
   - Examples already present:
-    - `ki/random_splits/train.parquet`
+    - `ki/random_splits_grouped_sequence/train.parquet`
     - `ki/enzyme_sequence_splits/threshold_0.05/train.parquet`
-    - `kd/enzyme_structure_splits/threshold_0.7/test.parquet`
+    - `kd/enzyme_sequence_splits/threshold_<t>/test.parquet`
     - `ec50/substrate_splits/threshold_0.55/val.parquet`
     - `ic50/uniprot_time_splits/test.parquet`
 - Mapping from user schema to baseline schema:
@@ -117,9 +116,6 @@
 - `emulator_bench/train_single_target_tvt.py`: explicit train/val/test retraining wrapper with AMP and checkpointing
 - `emulator_bench/predict_single_target.py`: standalone checkpoint evaluation wrapper
 - `emulator_bench/run_split_benchmarks.py`: sequential runner across discovered split jobs
-- `emulator_bench/tune_optuna.py`: Optuna tuning limited to retraining-safe optimization hyperparameters
-- `emulator_bench/launch_parallel_optuna.py`: multi-GPU parallel Optuna worker launcher
-- `emulator_bench/launch_parallel_retrain_from_optuna.py`: multi-GPU parallel retrain launcher from the best Optuna result
 - `emulator_bench/default_hparams_original.json`: frozen copy of BACPI’s original affinity defaults
 - `emulator_bench/__init__.py`: package marker
 
@@ -138,11 +134,10 @@
 ## 8. Exact Execution Plan
 
 1. Activate or invoke the provided environment with `conda run -n mldb`.
-2. Inspect the dataset and validate schema and split membership under `~/github/EMULaToR/data/processed/baselines/BACPI/<value_type>`.
+2. Inspect the dataset and validate schema and split membership under `~/github/EMULaToR/data/processed/datasets/{kinetic_dataset/ki,binding_affinity_dataset/<kd|ic50|ec50>}`.
 3. Build and persist BACPI featurizer vocabularies from the requested split universe.
 4. Cache unique compound and protein features once under `embeddings/`.
 5. Launch BACPI retraining on explicit train/val/test splits through `emulator_bench/train_single_target_tvt.py`.
 6. Evaluate the best checkpoint on train, validation, and test and write metrics plus predictions.
-7. Run Optuna only over retraining-safe optimization hyperparameters, then launch parallel multi-GPU retraining from the best study result.
-8. Run a small-sample smoke test with `CUDA_VISIBLE_DEVICES=3`.
-9. Record outputs, metrics, cache locations, and command examples in `emulator_bench/README.md` and `commands.txt`.
+7. Run a small-sample smoke test with `a free GPU`.
+8. Record outputs, metrics, cache locations, and command examples in `emulator_bench/README.md` and `commands.txt`.

@@ -1,7 +1,7 @@
 {
   "model_name": "BACPI",
   "task": "affinity",
-  "architecture_locked": true,
+  "source": "code/main.py argparse defaults; Adam(amsgrad=True, weight_decay=0), MSE loss, StepLR(10, 0.5)",
   "defaults": {
     "lr": 0.0005,
     "step_size": 10,
@@ -18,14 +18,5 @@
     "window": 5,
     "layer_cnn": 3,
     "layer_out": 3
-  },
-  "optuna_tunable_retraining_hparams": [
-    "batch_size",
-    "lr",
-    "weight_decay",
-    "step_size",
-    "gamma",
-    "grad_clip",
-    "patience"
-  ]
+  }
 }

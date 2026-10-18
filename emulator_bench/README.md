@@ -1,138 +1,62 @@
 # emulator_bench
 
-This bench adds an EMULaToR-style retraining workflow to `BACPI` without modifying the original `code/` model implementation.
+Multi-seed evaluation of BACPI with its original settings on the default EMULaToR splits.
+The original `code/` is not changed.
 
-It is designed for BACPI affinity split trees under:
+## Tasks and splits
 
-- `~/github/EMULaToR/data/processed/baselines/BACPI/<value_type>`
+| Task | Split parent |
+|---|---|
+| `ki` | `data/processed/datasets/kinetic_dataset/ki` |
+| `kd`, `ec50`, `ic50` | `data/processed/datasets/binding_affinity_dataset/<task>` |
 
-Supported `value_type` folders:
+Split folders per task: `random_splits_grouped_sequence`, `random_splits_grouped_smiles`,
+`uniprot_time_splits`, `enzyme_sequence_splits/threshold_*`, `substrate_splits/threshold_*`.
+Thresholds are read from disk. Each folder needs `train.parquet`, `val.parquet`, `test.parquet`
+with columns `sequence`, `smiles`, `log10_value`.
 
-- `ki`
-- `kd`
-- `ec50`
-- `ic50`
+Split files are never written. Rows with invalid SMILES are dropped in memory only.
+The count per split is saved in `run_summary.json` as `rows_dropped_invalid_smiles`.
 
-## What The Model Uses
+SMILES go to RDKit exactly as in the original `code/data_process.py` (whitespace stripped, no canonicalisation).
+The vocabularies follow the original dictionaries: ids are assigned in first-encounter order.
+The original encounters train rows in file order, one dataset at a time. Here the encounter order is the
+sorted unique SMILES and sequences over all four tasks and all default splits (train, val and test).
+The vocabulary is built once, so it does not depend on `--tasks` or on which tasks were cached first.
 
-Inputs per sample:
+## Original settings
 
-- Compound `smiles`
-- Protein `sequence`
-- Affinity target, defaulting to `log10_value`
+From `code/main.py`: Adam (`amsgrad=True`, no weight decay), `lr=5e-4`, StepLR (step 10, gamma 0.5),
+batch size 16, 20 epochs, MSE loss, fp32, no early stopping, no gradient clipping.
+The epoch with the lowest validation RMSE gives the test metrics.
+Architecture: `gat_dim=50`, `num_head=3`, `dropout=0.1`, `alpha=0.1`, `comp_dim=prot_dim=latent_dim=80`,
+`window=5`, `layer_cnn=3`, `layer_out=3`.
+Compound features: RDKit graph fingerprint ids and a 1024-bit Morgan fingerprint (radius 2, chirality).
+Protein features: amino-acid 3-grams.
 
-Bench feature path:
+Seeds: 666, 777, 888.
 
-- Compounds use BACPI's native RDKit graph featurization:
-  - atom-environment graph fingerprint ids from the original `atom_features` pipeline
-  - adjacency matrix with self-loops
-  - Morgan fingerprint bits with radius `2` and `1024` bits
-- Proteins use BACPI's native sequence featurization:
-  - amino-acid 3-gram tokenization with the original `-SEQ=` framing
+## Scripts
 
-Model path:
+- `cache_embeddings.py`: caches compound and protein features once, in one shared cache for all tasks.
+- `train_single_target_tvt.py`: trains one split and one seed.
+- `run_split_benchmarks.py`: builds the cache, then runs every seed on every split of every task.
+  Finished runs are skipped unless `--overwrite` is set.
+- `aggregate_retrain_metrics.py`: writes `summary_runs.csv` and `summary.csv` (mean and std over seeds).
+- `predict_single_target.py`: evaluates a saved `bestmodel.pth` on one split file.
+- `model_v2.py`, `modeling_v2.py`: memory-efficient BACPI. It gives the same outputs as `code/model.py`.
 
-- The bench imports the original `BACPI` module from [code/model.py](/home/adhil/github/BACPI/code/model.py)
-- The default architecture remains the original affinity configuration:
-  - `gat_dim=50`
-  - `num_head=3`
-  - `dropout=0.1`
-  - `alpha=0.1`
-  - `comp_dim=80`
-  - `prot_dim=80`
-  - `latent_dim=80`
-  - `window=5`
-  - `layer_cnn=3`
-  - `layer_out=3`
+## Output layout
 
-## How Embeddings Are Cached
+Default `--out_root`: `outputs/baselines/BACPI`.
 
-BACPI does not use external pretrained embeddings, so this bench caches the expensive native input featurization instead of recomputing it every run.
+- `embeddings/`: feature cache and vocabularies
+- `<task>/<split_group>/<split_name>/seed_<seed>/`: `bestmodel.pth`, `logfile.csv`,
+  `final_results_{train,val,test}.csv` (rmse, mae, r2_score, pearson, spearman),
+  `pred_label_{val,test}.csv`, `run_summary.json`
 
-Global cache layout:
+Random and time splits use `<split_name> = all`.
 
-- `embeddings/vocabs/featurizer.pkl`
-  - frozen BACPI vocabularies for atom symbols, bonds, graph fingerprints, edges, and protein 3-grams
-- `embeddings/compounds/<hash-prefix>/<hash>.npz`
-  - one file per unique canonical SMILES
-  - stores compound graph fingerprint ids, adjacency matrix, and Morgan fingerprint bits
-- `embeddings/proteins/<hash-prefix>/<hash>.npz`
-  - one file per unique normalized sequence
-  - stores the 3-gram token ids used by BACPI
-- `embeddings/manifest.json`
-  - records cache settings, token counts, and discovered split coverage
+## Commands
 
-Shared multi-target cache:
-
-- When you pass multiple `value_type` values, the bench now defaults to one shared cache under `~/github/EMULaToR/data/processed/baselines/BACPI/embeddings_shared`
-- That shared cache is built from the union of all requested split trees, so BACPI featurization work for repeated compounds and proteins is only done once across `ki`, `kd`, `ec50`, and `ic50`
-
-Cache behavior:
-
-- Features are computed once per unique compound or protein and reused across train, validation, test, Optuna trials, and multi-GPU retrains
-- Shared-cache mode saves additional compute across value types because many compounds and protein sequences overlap between targets
-- Split files with invalid SMILES are cleaned in place during cache building by default, so the TVT filtering cost is paid once and later runs reuse the cleaned files
-- Cache rebuilding is incremental by default: existing compound and protein `.npz` files are left in place and only missing cache entries are written
-- If new split data introduces compound/protein features that were not in an existing vocabulary, the cache builder extends the vocabulary while preserving existing token IDs
-- The train wrapper refuses to run if required cache files are missing, so repeated RDKit and tokenization work does not silently creep back in
-- The train path can preload the cache into CPU memory to reduce I/O stalls
-
-## Bench Scripts
-
-Core scripts:
-
-- `cache_embeddings.py`
-  - scans the requested split jobs
-  - builds the frozen BACPI featurizer vocabularies
-  - caches all unique compounds and proteins once
-- `train_single_target_tvt.py`
-  - trains BACPI on one explicit train/val/test split
-  - writes `bestmodel.pth`, `final_results_train.csv`, `final_results_val.csv`, `final_results_test.csv`, and val/test prediction CSVs
-- `predict_single_target.py`
-  - evaluates a saved checkpoint on one split file
-
-Benchmark and tuning scripts:
-
-- `run_split_benchmarks.py`
-  - sequential runner across discovered split jobs and seeds
-- `tune_optuna.py`
-  - tunes only retraining-safe optimization hyperparameters
-- `launch_parallel_optuna.py`
-  - launches multiple single-GPU Optuna workers against one shared study
-- `launch_parallel_retrain_from_optuna.py`
-  - retrains many split jobs in parallel across multiple GPUs from the best Optuna result
-
-## Enhancements In This Bench
-
-Compared with the original repo flow, this bench adds:
-
-- Explicit train/val/test split loading from parquet or CSV
-- One-time reusable feature caching for compounds and proteins
-- Automatic mixed precision:
-  - `bf16` on Ampere-or-newer CUDA devices
-  - `fp16` on older CUDA devices
-- TF32 enabled for CUDA matmul and cuDNN where available
-- Pinned-memory DataLoaders, worker prefetching, and persistent workers
-- Length-aware bucketed batching to reduce padding waste
-- No extra batch-shape rounding by default; `pad_to_multiple` now defaults to `1` so batches are padded only to the natural max length inside the batch
-- Optional cache preloading so GPUs spend less time waiting on disk
-- Best-checkpoint validation selection and final train/val/test metric dumps
-- Optuna tuning restricted to retraining-safe hyperparameters:
-  - `batch_size`
-  - `lr`
-  - `weight_decay`
-  - `step_size`
-  - `gamma`
-  - `grad_clip`
-  - `patience`
-- Multi-GPU parallel retraining from the best Optuna result
-
-## Notes
-
-- The bench targets BACPI affinity tasks only for `Ki`, `Kd`, `EC50`, and `IC50`
-- The default target is `log10_value`; pass `--target_col value` if you want the raw split column instead
-- The cache is specific to the split universe used when `cache_embeddings.py` runs. If you expand to new split files with unseen compounds or proteins, rebuild the cache or point the run at a different `embeddings/` directory
-- If you run multi-value retraining without specifying `--embeddings_dir`, the launcher will automatically use the shared cache path
-- Rows with invalid RDKit-parsable SMILES are dropped automatically during cache building, training, and prediction instead of crashing the run
-- If cache building sees invalid SMILES, it overwrites the split file with the cleaned rows unless you pass `--no_clean_splits_in_place`
-- Use `conda run -n mldb ...` for all commands in this repo
+See `../commands.txt`. Use the mldb conda env: `conda run -n mldb python ...`.

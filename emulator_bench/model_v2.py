@@ -45,10 +45,11 @@ class GATLayerV2(nn.Module):
         self.W = nn.Parameter(torch.empty(in_features, out_features))
         nn.init.xavier_uniform_(self.W, gain=1.414)
 
-        self.a_left = nn.Parameter(torch.empty(out_features, 1))
-        self.a_right = nn.Parameter(torch.empty(out_features, 1))
-        nn.init.xavier_uniform_(self.a_left, gain=1.414)
-        nn.init.xavier_uniform_(self.a_right, gain=1.414)
+        # Same initialisation as the original (2D, 1) attention vector, then split in halves.
+        a = torch.empty(2 * out_features, 1)
+        nn.init.xavier_uniform_(a, gain=1.414)
+        self.a_left = nn.Parameter(a[:out_features].clone())
+        self.a_right = nn.Parameter(a[out_features:].clone())
 
     def forward(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         Wh = torch.matmul(h, self.W)  # [B, N, D]
