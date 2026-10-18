@@ -1,21 +1,25 @@
-# Run from baselines/BACPI with the mldb conda env (conda run -n mldb python ...).
+# Run from baselines/BACPI (the submodule root). Default output: EMULaToR/outputs/baselines/BACPI.
+PY=/home/adhil/.conda/envs/mldb/bin/python
 
 # All tasks, all default splits, seeds 666 777 888 (one GPU, sequential)
-python emulator_bench/run_split_benchmarks.py --tasks ki kd ec50 ic50 --seeds 666 777 888 --device cuda:0
+$PY emulator_bench/run_split_benchmarks.py --tasks ki kd ec50 ic50 --seeds 666 777 888 --device cuda:0
 
 # One task on a chosen GPU
-CUDA_VISIBLE_DEVICES=1 python emulator_bench/run_split_benchmarks.py --tasks kd --device cuda:0
+CUDA_VISIBLE_DEVICES=1 $PY emulator_bench/run_split_benchmarks.py --tasks kd --device cuda:0
+
+# Spread runs over GPUs 0-3, two runs per GPU, bf16 mixed precision (--amp is optional; default is fp32)
+$PY emulator_bench/run_split_benchmarks.py --tasks ki kd ec50 ic50 --gpus 0 1 2 3 --runs_per_gpu 2 --amp
 
 # Selected split groups or thresholds
-python emulator_bench/run_split_benchmarks.py --tasks ki --split_groups enzyme_sequence_splits substrate_splits --thresholds threshold_0.05
+$PY emulator_bench/run_split_benchmarks.py --tasks ki --split_groups enzyme_sequence_splits substrate_splits --thresholds threshold_0.05
 
 # Cache only
-python emulator_bench/cache_embeddings.py --tasks ki kd ec50 ic50
+$PY emulator_bench/cache_embeddings.py --tasks ki kd ec50 ic50
 
-# Mean and std over seeds
-python emulator_bench/aggregate_retrain_metrics.py
+# Mean and std over seeds (writes summary_runs.csv and summary.csv in the output root)
+$PY emulator_bench/aggregate_retrain_metrics.py
 
 # Evaluate a saved model
-python emulator_bench/predict_single_target.py --checkpoint <run_dir>/bestmodel.pth \
+$PY emulator_bench/predict_single_target.py --checkpoint <run_dir>/bestmodel.pth \
     --split_path ../../data/processed/datasets/kinetic_dataset/ki/uniprot_time_splits/test.parquet \
-    --embeddings_dir ../../data/processed/baselines/BACPI/embeddings --out_dir <out_dir>
+    --embeddings_dir ../../outputs/baselines/BACPI/embeddings --out_dir <out_dir>

@@ -18,6 +18,7 @@ from emulator_bench.common import (
 from emulator_bench.feature_pipeline import (
     BACPIFeaturizer,
     compound_cache_path,
+    featurizer_path,
     filter_invalid_smiles_rows,
     protein_cache_path,
     save_npz_atomic,
@@ -41,9 +42,9 @@ def build_cache(jobs, embeddings_dir: Path, sequence_col: str = "sequence", smil
     smiles_values, sequences = collect_unique_values(jobs, sequence_col, smiles_col)
     print("Split jobs: %s | unique compounds: %s | unique proteins: %s" % (len(jobs), len(smiles_values), len(sequences)), flush=True)
 
-    featurizer_path = embeddings_dir / "vocabs" / "featurizer.pkl"
-    if featurizer_path.exists():
-        featurizer = BACPIFeaturizer.load(featurizer_path)
+    vocab_path = featurizer_path(embeddings_dir)
+    if vocab_path.exists():
+        featurizer = BACPIFeaturizer.load(vocab_path)
     else:
         # The vocabulary covers every task and split group on disk, whatever jobs are cached now.
         vocab_jobs = [
@@ -54,7 +55,7 @@ def build_cache(jobs, embeddings_dir: Path, sequence_col: str = "sequence", smil
         vocab_smiles, vocab_sequences = collect_unique_values(vocab_jobs, sequence_col, smiles_col)
         featurizer = BACPIFeaturizer()
         featurizer.build_from_values(vocab_smiles, vocab_sequences)
-        featurizer.save(featurizer_path)
+        featurizer.save(vocab_path)
 
     for values, path_fn, encode in (
         (smiles_values, compound_cache_path, featurizer.encode_compound),

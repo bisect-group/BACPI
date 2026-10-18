@@ -41,7 +41,8 @@ Seeds: 666, 777, 888.
 - `cache_embeddings.py`: caches compound and protein features once, in one shared cache for all tasks.
 - `train_single_target_tvt.py`: trains one split and one seed.
 - `run_split_benchmarks.py`: builds the cache, then runs every seed on every split of every task.
-  Finished runs are skipped unless `--overwrite` is set.
+  Finished runs are skipped unless `--overwrite` is set. `--gpus 0 1 --runs_per_gpu 2` runs several trainings at once, one GPU each.
+  `--amp` turns on mixed precision (bf16, or fp16 on pre-Ampere GPUs). Default is fp32.
 - `aggregate_retrain_metrics.py`: writes `summary_runs.csv` and `summary.csv` (mean and std over seeds).
 - `predict_single_target.py`: evaluates a saved `bestmodel.pth` on one split file.
 - `model_v2.py`, `modeling_v2.py`: memory-efficient BACPI. It gives the same outputs as `code/model.py`.
@@ -50,7 +51,8 @@ Seeds: 666, 777, 888.
 
 Default `--out_root`: `outputs/baselines/BACPI`.
 
-- `embeddings/`: feature cache and vocabularies
+- `embeddings/`: feature cache `compounds_v2/`, `proteins_v2/` and the frozen vocabulary `vocabs_v2/`.
+  Cache keys cover the featurizer settings. Change `CACHE_VERSION` in `feature_pipeline.py` to force a rebuild.
 - `<task>/<split_group>/<split_name>/seed_<seed>/`: `bestmodel.pth`, `logfile.csv`,
   `final_results_{train,val,test}.csv` (rmse, mae, r2_score, pearson, spearman),
   `pred_label_{val,test}.csv`, `run_summary.json`
@@ -59,4 +61,4 @@ Random and time splits use `<split_name> = all`.
 
 ## Commands
 
-See `../commands.txt`. Use the mldb conda env: `conda run -n mldb python ...`.
+See `../commands.txt`. Run the commands from the `baselines/BACPI` folder. Use the mldb conda env: `conda run -n mldb python ...`.

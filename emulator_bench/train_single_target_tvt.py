@@ -3,10 +3,8 @@ import datetime
 import os
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -15,16 +13,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from emulator_bench.common import append_csv_row, read_table, regression_metrics, require_columns, save_json, set_seed
+from emulator_bench.common import append_csv_row, read_table, regression_metrics, require_columns, resolve_amp_dtype, save_json, set_seed
 from emulator_bench.dataset import BACPIDataset, CacheStore, create_loader
-from emulator_bench.feature_pipeline import BACPIFeaturizer, compound_cache_path, filter_invalid_smiles_rows, protein_cache_path
+from emulator_bench.feature_pipeline import BACPIFeaturizer, compound_cache_path, featurizer_path, filter_invalid_smiles_rows, protein_cache_path
 from emulator_bench.modeling_v2 import BACPIModelConfig, build_model
 
 
-def autocast_context(device: torch.device, amp: bool):
-    if amp and device.type == "cuda":
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    return nullcontext()
+def autocast_context(device: torch.device, amp_dtype):
+    return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
 
 
 def move_batch_to_device(batch, device: torch.device):
@@ -42,13 +38,13 @@ def forward_batch(model, batch):
     )
 
 
-def evaluate_loader(model, loader, device, amp=False):
+def evaluate_loader(model, loader, device, amp_dtype=None):
     model.eval()
     preds, truths = [], []
     with torch.inference_mode():
         for batch in loader:
             batch = move_batch_to_device(batch, device)
-            with autocast_context(device, amp):
+            with autocast_context(device, amp_dtype):
                 prediction = forward_batch(model, batch)
             preds.append(prediction.detach().cpu().float())
             truths.append(batch["targets"].detach().cpu().float())
@@ -57,17 +53,22 @@ def evaluate_loader(model, loader, device, amp=False):
     return y_true, y_pred, regression_metrics(y_true, y_pred)
 
 
-def train_one_epoch(model, loader, optimizer, device, amp=False):
+def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=None):
     model.train()
     total_loss, total_samples = 0.0, 0
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        with autocast_context(device, amp):
+        with autocast_context(device, amp_dtype):
             prediction = forward_batch(model, batch)
         loss = F.mse_loss(prediction.float(), batch["targets"].float())
-        loss.backward()
-        optimizer.step()
+        if scaler is None:
+            loss.backward()
+            optimizer.step()
+        else:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         n = int(batch["targets"].shape[0])
         total_loss += float(loss.item()) * n
         total_samples += n
@@ -136,11 +137,13 @@ def main():
     parser.add_argument("--num_workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--seed", type=int, default=666)
     parser.add_argument("--skip_smiles_validity_check", action="store_true")
-    parser.add_argument("--amp", action="store_true", help="bf16 autocast; the original code trains in fp32")
+    parser.add_argument("--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. The original code trains in fp32")
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device(args.device)
+    amp_dtype, precision = resolve_amp_dtype(device) if args.amp else (None, "fp32")
+    scaler = torch.amp.GradScaler("cuda") if amp_dtype == torch.float16 else None
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     prepared = {name: prepare_split_frame(getattr(args, "%s_path" % name), args) for name in ("train", "val", "test")}
@@ -148,7 +151,7 @@ def main():
     rows_dropped_invalid_smiles = {name: dropped for name, (_, dropped) in prepared.items()}
     for frame in frames.values():
         ensure_split_cache(args.embeddings_dir, frame, args.smiles_col, args.sequence_col)
-    featurizer = BACPIFeaturizer.load(args.embeddings_dir / "vocabs" / "featurizer.pkl")
+    featurizer = BACPIFeaturizer.load(featurizer_path(args.embeddings_dir))
 
     compound_store = CacheStore(lambda smiles: compound_cache_path(args.embeddings_dir, smiles))
     protein_store = CacheStore(lambda sequence: protein_cache_path(args.embeddings_dir, sequence))
@@ -181,8 +184,8 @@ def main():
     log_path.unlink(missing_ok=True)
     for epoch in range(1, args.num_epochs + 1):
         row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"]}
-        row["train_loss"] = train_one_epoch(model, loaders["train"], optimizer, device, args.amp)
-        _, _, val_metrics = evaluate_loader(model, loaders["val"], device, args.amp)
+        row["train_loss"] = train_one_epoch(model, loaders["train"], optimizer, device, amp_dtype, scaler)
+        _, _, val_metrics = evaluate_loader(model, loaders["val"], device, amp_dtype)
         row["val_rmse"] = val_metrics["rmse"]
         if val_metrics["rmse"] < best_rmse:
             best_rmse, best_epoch = val_metrics["rmse"], epoch
@@ -195,7 +198,7 @@ def main():
     model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])
     results = {}
     for name in ("train", "val", "test"):
-        y_true, y_pred, metrics = evaluate_loader(model, loaders[name], device, args.amp)
+        y_true, y_pred, metrics = evaluate_loader(model, loaders[name], device, amp_dtype)
         results[name] = metrics
         pd.DataFrame([metrics]).to_csv(args.out_dir / ("final_results_%s.csv" % name), index=False)
         if name != "train":
@@ -211,7 +214,7 @@ def main():
             "best_val_rmse": best_rmse,
             "split_sizes": sizes,
             "rows_dropped_invalid_smiles": rows_dropped_invalid_smiles,
-            "precision": "bf16" if args.amp and device.type == "cuda" else "fp32",
+            "precision": precision,
             "final_metrics": results,
             "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         },

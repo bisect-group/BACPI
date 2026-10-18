@@ -1,6 +1,9 @@
 import argparse
+import os
+import queue
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +23,16 @@ from emulator_bench.common import (
 TRAIN_SCRIPT = REPO_ROOT / "emulator_bench" / "train_single_target_tvt.py"
 
 
+def train(cmd, slots):
+    gpu = slots.get()
+    try:
+        env = None if gpu is None else {**os.environ, "CUDA_VISIBLE_DEVICES": gpu}
+        print("Running %s" % " ".join(cmd[-14:]), flush=True)
+        subprocess.run(cmd, check=True, cwd=str(REPO_ROOT), env=env)
+    finally:
+        slots.put(gpu)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train BACPI with its original settings for every seed on every default split.")
     parser.add_argument("--tasks", nargs="+", default=list(TASK_PARENTS), choices=list(TASK_PARENTS))
@@ -30,9 +43,11 @@ def main():
     parser.add_argument("--thresholds", nargs="+", default=None)
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument("--num_epochs", type=int, default=20)
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device when --gpus is not set.")
+    parser.add_argument("--gpus", nargs="+", default=None, help="Physical GPU ids, e.g. --gpus 0 1 2. Each run sees one GPU as cuda:0.")
+    parser.add_argument("--runs_per_gpu", type=int, default=1, help="Concurrent runs per GPU (per --device when --gpus is not set).")
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. Default is fp32.")
     parser.add_argument("--skip_smiles_validity_check", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -47,6 +62,7 @@ def main():
         raise FileNotFoundError("No split jobs found for tasks %s" % args.tasks)
     build_cache(all_jobs, embeddings_dir, datasets_root=args.datasets_root)
 
+    commands = []
     for task, jobs in task_jobs.items():
         for job in jobs:
             for seed in args.seeds:
@@ -62,7 +78,7 @@ def main():
                     "--out_dir", str(run_dir),
                     "--task_name", "%s_%s_%s_seed%s" % (task, job["split_group"], job["split_name"], seed),
                     "--num_epochs", str(args.num_epochs),
-                    "--device", args.device,
+                    "--device", "cuda:0" if args.gpus else args.device,
                     "--num_workers", str(args.num_workers),
                     "--seed", str(seed),
                 ]
@@ -70,8 +86,14 @@ def main():
                     cmd.append("--amp")
                 if args.skip_smiles_validity_check:
                     cmd.append("--skip_smiles_validity_check")
-                print("Running %s" % " ".join(cmd[-14:]), flush=True)
-                subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))
+                commands.append(cmd)
+
+    slots = queue.Queue()
+    for gpu in args.gpus or [None]:
+        for _ in range(args.runs_per_gpu):
+            slots.put(None if gpu is None else str(gpu))
+    with ThreadPoolExecutor(slots.qsize()) as pool:
+        list(pool.map(lambda cmd: train(cmd, slots), commands))
 
 
 if __name__ == "__main__":

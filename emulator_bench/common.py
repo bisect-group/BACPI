@@ -63,6 +63,15 @@ def append_csv_row(path: Path, row: Dict) -> None:
         writer.writerow(row)
 
 
+def resolve_amp_dtype(device: torch.device):
+    """bf16 on Ampere or newer, fp16 on older GPUs, None (fp32) on CPU."""
+    if device.type != "cuda":
+        return None, "fp32"
+    if torch.cuda.get_device_capability(device)[0] >= 8:
+        return torch.bfloat16, "bf16"
+    return torch.float16, "fp16"
+
+
 def read_table(path: Path) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix == ".parquet":

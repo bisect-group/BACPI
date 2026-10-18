@@ -7,12 +7,12 @@ import pandas as pd
 from rdkit import Chem, DataStructs, RDLogger
 from rdkit.Chem import AllChem
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 from emulator_bench.common import ensure_parent, stable_hash
 
@@ -25,6 +25,7 @@ DEFAULT_RADIUS = 2
 DEFAULT_NGRAM = 3
 DEFAULT_FP_RADIUS = 2
 DEFAULT_NBITS = 1024
+CACHE_VERSION = 2
 
 
 def normalize_sequence(sequence: str) -> str:
@@ -65,21 +66,26 @@ def filter_invalid_smiles_rows(frame: pd.DataFrame, smiles_col: str, source_name
 
 
 def compound_cache_key(smiles: str) -> str:
-    return stable_hash(normalize_smiles_text(smiles))
+    settings = "radius=%s|fp_radius=%s|nbits=%s" % (DEFAULT_RADIUS, DEFAULT_FP_RADIUS, DEFAULT_NBITS)
+    return stable_hash("%s|%s" % (settings, normalize_smiles_text(smiles)))
 
 
 def protein_cache_key(sequence: str) -> str:
-    return stable_hash(normalize_sequence(sequence))
+    return stable_hash("ngram=%s|%s" % (DEFAULT_NGRAM, normalize_sequence(sequence)))
+
+
+def featurizer_path(embeddings_dir: Path) -> Path:
+    return Path(embeddings_dir) / ("vocabs_v%s" % CACHE_VERSION) / "featurizer.pkl"
 
 
 def compound_cache_path(embeddings_dir: Path, smiles: str) -> Path:
     key = compound_cache_key(smiles)
-    return Path(embeddings_dir) / "compounds" / key[:2] / ("%s.npz" % key)
+    return Path(embeddings_dir) / ("compounds_v%s" % CACHE_VERSION) / key[:2] / ("%s.npz" % key)
 
 
 def protein_cache_path(embeddings_dir: Path, sequence: str) -> Path:
     key = protein_cache_key(sequence)
-    return Path(embeddings_dir) / "proteins" / key[:2] / ("%s.npz" % key)
+    return Path(embeddings_dir) / ("proteins_v%s" % CACHE_VERSION) / key[:2] / ("%s.npz" % key)
 
 
 def save_npz_atomic(path: Path, payload: Dict) -> None:
