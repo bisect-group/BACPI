@@ -26,7 +26,9 @@ DEFAULT_SPLIT_GROUPS = [
     "random_splits_grouped_smiles",
     "uniprot_time_splits",
     "enzyme_sequence_splits",
+    "enzyme_structure_splits",
     "substrate_splits",
+    "conformer_cosine_splits",
 ]
 DEFAULT_SEEDS = [666, 777, 888]
 
@@ -72,12 +74,12 @@ def resolve_amp_dtype(device: torch.device):
     return torch.float16, "fp16"
 
 
-def read_table(path: Path) -> pd.DataFrame:
+def read_table(path: Path, columns: Optional[List[str]] = None) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix == ".parquet":
-        return pd.read_parquet(path)
+        return pd.read_parquet(path, columns=columns)
     if suffix == ".csv":
-        return pd.read_csv(path)
+        return pd.read_csv(path, usecols=columns)
     raise ValueError("Unsupported table format: %s" % path)
 
 

@@ -1,7 +1,9 @@
+import multiprocessing
 import pickle
+import shutil
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -80,26 +82,8 @@ def featurizer_path(embeddings_dir: Path) -> Path:
     return Path(embeddings_dir) / ("vocabs_v%s" % CACHE_VERSION) / "featurizer.pkl"
 
 
-def compound_cache_path(embeddings_dir: Path, smiles: str) -> Path:
-    key = compound_cache_key(smiles)
-    return Path(embeddings_dir) / ("compounds_v%s" % CACHE_VERSION) / key[:2] / ("%s.npz" % key)
-
-
-def protein_cache_path(embeddings_dir: Path, sequence: str) -> Path:
-    key = protein_cache_key(sequence)
-    return Path(embeddings_dir) / ("proteins_v%s" % CACHE_VERSION) / key[:2] / ("%s.npz" % key)
-
-
 def packed_dir(embeddings_dir: Path) -> Path:
     return Path(embeddings_dir) / ("packed_v%s" % CACHE_VERSION)
-
-
-def save_npz_atomic(path: Path, payload: Dict) -> None:
-    ensure_parent(path)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "wb") as handle:
-        np.savez_compressed(handle, **payload)
-    tmp_path.replace(path)
 
 
 class BACPIFeaturizer:
@@ -134,29 +118,33 @@ class BACPIFeaturizer:
         mapping[key] = index
         return index
 
-    def _create_atoms(self, mol, build: bool):
+    @staticmethod
+    def raw_keys(mol):
+        """Vocabulary-free description of a molecule: atom keys and bonds as (begin, end, bond type)."""
         atoms = [atom.GetSymbol() for atom in mol.GetAtoms()]
         for atom in mol.GetAromaticAtoms():
             index = atom.GetIdx()
             atoms[index] = (atoms[index], "aromatic")
-        encoded = [self._lookup(self.atom_dict, atom, build) for atom in atoms]
-        return np.asarray(encoded, dtype=np.int32)
+        bonds = [(bond.GetBeginAtomIdx(), bond.GetEndAtomIdx(), str(bond.GetBondType())) for bond in mol.GetBonds()]
+        return atoms, bonds
 
-    def _create_ijbonddict(self, mol, build: bool):
+    def _create_ijbonddict(self, n_atoms: int, bonds, build: bool):
         i_jbond_dict = {}
-        for bond in mol.GetBonds():
-            begin_idx = bond.GetBeginAtomIdx()
-            end_idx = bond.GetEndAtomIdx()
-            bond_id = self._lookup(self.bond_dict, str(bond.GetBondType()), build)
+        for begin_idx, end_idx, bond_type in bonds:
+            bond_id = self._lookup(self.bond_dict, bond_type, build)
             i_jbond_dict.setdefault(begin_idx, []).append((end_idx, bond_id))
             i_jbond_dict.setdefault(end_idx, []).append((begin_idx, bond_id))
 
-        atom_indices = set(range(mol.GetNumAtoms()))
-        isolated = atom_indices - set(i_jbond_dict.keys())
+        isolated = set(range(n_atoms)) - set(i_jbond_dict.keys())
         nan_bond = self._lookup(self.bond_dict, "nan", build)
         for atom_idx in isolated:
             i_jbond_dict.setdefault(atom_idx, []).append((atom_idx, nan_bond))
         return i_jbond_dict
+
+    def compound_tokens(self, atom_keys, bonds, build: bool):
+        atoms = np.asarray([self._lookup(self.atom_dict, key, build) for key in atom_keys], dtype=np.int32)
+        i_jbond_dict = self._create_ijbonddict(len(atom_keys), bonds, build)
+        return self._atom_features(atoms, i_jbond_dict, build)
 
     def _atom_features(self, atoms, i_jbond_dict, build: bool):
         if len(atoms) == 1 or self.radius == 0:
@@ -208,34 +196,11 @@ class BACPIFeaturizer:
         if mol is None:
             raise ValueError("Invalid SMILES: %s" % normalize_smiles_text(smiles))
         mol = Chem.AddHs(mol)
-        atoms = self._create_atoms(mol, build=build)
-        i_jbond_dict = self._create_ijbonddict(mol, build=build)
-        compound_tokens = self._atom_features(atoms, i_jbond_dict, build=build)
-        return {
-            "compounds": compound_tokens.astype(np.int32),
-            "adjacencies": self._create_adjacency(mol).astype(np.uint8),
-            "fingerprint": self._fingerprint_bits(mol).astype(np.uint8),
-            "compound_length": np.asarray([int(compound_tokens.shape[0])], dtype=np.int32),
-        }
+        tokens = self.compound_tokens(*self.raw_keys(mol), build=build)
+        return {"compounds": tokens, "adjacencies": self._create_adjacency(mol), "fingerprint": self._fingerprint_bits(mol)}
 
-    def encode_protein(self, sequence: str, build: bool = False) -> Dict:
-        normalized = normalize_sequence(sequence)
-        tokens = self._split_sequence(normalized, build=build)
-        return {
-            "proteins": tokens.astype(np.int32),
-            "protein_length": np.asarray([int(tokens.shape[0])], dtype=np.int32),
-            "normalized_sequence": np.asarray([normalized]),
-        }
-
-    def build_from_values(self, smiles_values: Iterable[str], sequence_values: Iterable[str]) -> None:
-        """Assign ids in first-encounter order like the original dictionaries, over sorted unique inputs."""
-        unique_smiles = sorted({normalize_smiles_text(value) for value in smiles_values})
-        for smiles in progress(unique_smiles, desc="Building compound vocabulary", unit="compound"):
-            if parse_smiles(smiles) is not None:
-                self.encode_compound(smiles, build=True)
-        unique_sequences = sorted({normalize_sequence(value) for value in sequence_values})
-        for sequence in progress(unique_sequences, desc="Building protein vocabulary", unit="protein"):
-            self.encode_protein(sequence, build=True)
+    def encode_protein(self, sequence: str, build: bool = False) -> np.ndarray:
+        return self._split_sequence(sequence, build=build)
 
     @property
     def n_atom_tokens(self) -> int:
@@ -270,44 +235,120 @@ class BACPIFeaturizer:
         return cls(**payload)
 
 
-def load_npz_payload(path: Path) -> Dict:
-    with np.load(path, allow_pickle=False) as payload:
-        return {key: payload[key] for key in payload.files}
+_worker_featurizer = None
+_worker_needed = frozenset()
 
 
-def pack_cache(embeddings_dir: Path) -> None:
-    """Pack every cached npz entry into flat binary files that processes share through the page cache.
+def _raw_compounds(chunk):
+    """Raw keys of each SMILES, plus adjacency and fingerprint for the needed ones. None marks an invalid SMILES."""
+    out = []
+    for smiles in chunk:
+        mol = parse_smiles(smiles)
+        if mol is None:
+            out.append(None)
+            continue
+        mol = Chem.AddHs(mol)
+        keys = BACPIFeaturizer.raw_keys(mol)
+        if smiles in _worker_needed:
+            out.append((keys, _worker_featurizer._create_adjacency(mol), _worker_featurizer._fingerprint_bits(mol)))
+        else:
+            out.append((keys, None, None))
+    return out
 
-    Compounds use tokens (int32), adjacencies (uint8, n x n) and fingerprints (uint8). Proteins use tokens.
-    Only valid SMILES have npz entries, so the compound index doubles as the validity record.
+
+def _new_ngrams(chunk):
+    """Distinct n-grams of each sequence in first-occurrence order."""
+    ngram = _worker_featurizer.ngram
+    padded = ["-%s=" % sequence for sequence in chunk]
+    return [tuple(dict.fromkeys(text[i : i + ngram] for i in range(len(text) - ngram + 1))) for text in padded]
+
+
+def encode_compounds_chunk(chunk):
+    return [_worker_featurizer.encode_compound(smiles) if parse_smiles(smiles) is not None else None for smiles in chunk]
+
+
+def encode_proteins_chunk(chunk):
+    return [_worker_featurizer.encode_protein(sequence) for sequence in chunk]
+
+
+def parallel_map(function, items, featurizer, workers: int, desc: str, needed=frozenset(), chunk_size: int = 64):
+    """Yield function(chunk) results per item in input order from forked workers that share the featurizer."""
+    global _worker_featurizer, _worker_needed
+    _worker_featurizer, _worker_needed = featurizer, needed
+    chunks = [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+    with multiprocessing.get_context("fork").Pool(workers) as pool:
+        for part in progress(pool.imap(function, chunks), desc=desc, unit="chunk", total=len(chunks)):
+            yield from part
+
+
+def compound_entry(encoded: Dict) -> tuple:
+    return encoded["compounds"], encoded["adjacencies"], encoded["fingerprint"]
+
+
+def build_vocabulary(featurizer: BACPIFeaturizer, smiles_values, sequence_values, needed_smiles, workers: int) -> Dict[str, tuple]:
+    """Assign vocabulary ids exactly as a serial pass over the sorted unique inputs.
+
+    Workers compute the id-free RDKit keys. This process assigns ids in order.
+    Returns the packed entries of `needed_smiles` that are valid SMILES in the vocabulary inputs.
     """
-    out = packed_dir(embeddings_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    for kind, fields in (("compounds", ("compounds", "adjacencies", "fingerprint")), ("proteins", ("proteins",))):
-        paths = sorted((Path(embeddings_dir) / ("%s_v%s" % (kind, CACHE_VERSION))).glob("*/*.npz"))
-        names = ("tokens", "adj", "fp")[: len(fields)]
+    unique_smiles = sorted({normalize_smiles_text(value) for value in smiles_values})
+    needed = frozenset(needed_smiles)
+    entries = {}
+    for smiles, raw in zip(unique_smiles, parallel_map(_raw_compounds, unique_smiles, featurizer, workers, "Building compound vocabulary", needed)):
+        if raw is not None:
+            keys, adjacency, fingerprint = raw
+            tokens = featurizer.compound_tokens(*keys, build=True)
+            if smiles in needed:
+                entries[smiles] = (tokens, adjacency, fingerprint)
+    unique_sequences = sorted({normalize_sequence(value) for value in sequence_values})
+    for ngrams in parallel_map(_new_ngrams, unique_sequences, featurizer, workers, "Building protein vocabulary"):
+        for token in ngrams:
+            featurizer._lookup(featurizer.word_dict, token, True)
+    return entries
+
+
+def write_packed(embeddings_dir: Path, new: Dict[str, Dict[str, tuple]]) -> None:
+    """Write the packed store: the old entries plus `new` ({kind: {key: arrays}}), sorted by key.
+
+    Compounds hold tokens (int32), adjacencies (uint8, n x n) and fingerprints (uint8). Proteins hold tokens.
+    The new store is built beside the old one and swapped in by rename.
+    """
+    final = packed_dir(embeddings_dir)
+    tmp, previous = final.with_name(final.name + ".tmp"), final.with_name(final.name + ".old")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    for kind, names in (("compounds", ("tokens", "adj", "fp")), ("proteins", ("tokens",))):
+        old = PackedCache(embeddings_dir, kind) if (final / ("%s.index.npz" % kind)).exists() else None
+        fresh = new[kind]
+        keys = sorted(set(old.index if old else ()) | set(fresh))
         offsets = {name: [0] for name in names[:2]}
         with ExitStack() as stack:
-            handles = [stack.enter_context(open(out / ("%s.%s.bin.tmp" % (kind, name)), "wb")) for name in names]
-            for path in progress(paths, desc="Packing %s" % kind, unit="entry"):
-                payload = load_npz_payload(path)
-                for name, field, handle in zip(names, fields, handles):
-                    handle.write(np.ascontiguousarray(payload[field]).tobytes())
+            handles = [stack.enter_context(open(tmp / ("%s.%s.bin" % (kind, name)), "wb")) for name in names]
+            for key in progress(keys, desc="Writing %s" % kind, unit="entry"):
+                if key in fresh:
+                    arrays = fresh[key]
+                elif kind == "compounds":
+                    arrays = compound_entry(old.compound(old.index[key]))
+                else:
+                    arrays = (old.tokens(old.index[key]),)
+                for name, array, handle in zip(names, arrays, handles):
+                    handle.write(np.ascontiguousarray(array).tobytes())
                     if name in offsets:
-                        offsets[name].append(offsets[name][-1] + payload[field].size)
-        for name in names:
-            (out / ("%s.%s.bin.tmp" % (kind, name))).replace(out / ("%s.%s.bin" % (kind, name)))
-        tmp_index = out / ("%s.index.tmp.npz" % kind)
+                        offsets[name].append(offsets[name][-1] + array.size)
         np.savez(
-            tmp_index,
-            keys=np.asarray([path.stem for path in paths]),
+            tmp / ("%s.index.npz" % kind),
+            keys=np.asarray(keys),
             **{"%s_offsets" % name: np.asarray(values, dtype=np.int64) for name, values in offsets.items()},
         )
-        tmp_index.replace(out / ("%s.index.npz" % kind))
+    shutil.rmtree(previous, ignore_errors=True)
+    if final.exists():
+        final.rename(previous)
+    tmp.rename(final)
+    shutil.rmtree(previous, ignore_errors=True)
 
 
 class PackedCache:
-    """Read-only view of the packed cache of one kind. Entries come from `pack_cache`."""
+    """Read-only view of the packed cache of one kind. Entries come from `write_packed`."""
 
     def __init__(self, embeddings_dir: Path, kind: str):
         directory = packed_dir(embeddings_dir)
