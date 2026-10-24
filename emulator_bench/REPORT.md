@@ -27,7 +27,7 @@ Paper and code agree. The paper gives no numbers for lr, batch size or epochs, s
 ## What the wrapper does now
 - `run_split_benchmarks.py` takes `--tasks` (ki kd ec50 ic50), finds the default split folders on disk, builds one shared feature cache, and trains every seed (default 666 777 888) on every split.
 - Ki uses `kinetic_dataset/ki`. Kd, EC50 and IC50 use `binding_affinity_dataset/<task>`.
-- Split folders found on disk: random_splits_grouped_sequence, random_splits_grouped_smiles, uniprot_time_splits, enzyme_sequence_splits/threshold_*, substrate_splits/threshold_*.
+- Split folders found on disk: random_splits_grouped_sequence, random_splits_grouped_smiles, uniprot_time_splits, enzyme_sequence_splits/threshold_*, enzyme_structure_splits/threshold_*, substrate_splits/threshold_*, conformer_cosine_splits/threshold_*.
   Current thresholds: ki 0.05 / 0.545, kd 0.01 / 0.39, ec50 0.01 / 0.525, ic50 0.01 / 0.63 (enzyme / substrate).
 - Output goes to `--out_root/<task>/<split_group>/<split_name>/seed_<seed>/` (default `outputs/baselines/BACPI`). Nothing is written next to the split files.
 - `aggregate_retrain_metrics.py` writes `summary_runs.csv` and `summary.csv` (mean and std over seeds; rmse, mae, r2_score, pearson, spearman; same metric key as the other wrappers).
@@ -61,6 +61,9 @@ Original `code/` is not touched.
 ## Speed-ups
 - Protein convolutions: each single-channel 11 x 11 conv in `BACPIv2.prot_cnn` runs as banded matrices and one `addmm` on an unfolded tensor (`banded_conv`). Above length 8192 the model uses the cuDNN conv. Parameters and `state_dict` keys are unchanged, so old checkpoints load.
 - Optimiser: Adam uses `fused=True` on CUDA.
+- Compile: `torch.compile(model, dynamic=True)` runs the model by default. `--no-compile` (launcher: `--no_compile`) runs it eagerly. Two graphs are built (train and eval) and variable lengths cause no recompiles. Warm-up is about 20 s per run. Over 100 batches, outputs differ from eager by at most 1.2e-8 and gradients by at most 2e-6 relative norm (output scale about 3e-2). Training for 2000 steps on 2 seeds stays inside the seed-to-seed spread.
+- Syncs: the train loss stays on the GPU for the whole epoch and is read once. Evaluation copies predictions to the CPU once, not per batch.
+- Speed at batch 16 on one A10 (steps per second, summed over runs): eager 21.2 with 1 run, 27.2 with 2, 27.3 with 3. Compiled 29.8 with 1 run, 33.9 with 2, 34.6 with 3. Use `--runs_per_gpu 2`.
 - Both changes are numerically equivalent but not bit-identical to the original conv and Adam. They change the order of float operations. Adam amplifies this over many steps.
 - The original run is itself not reproducible run to run in default mode (cuDNN and atomic-add kernels). Two identical runs give different losses.
 - Features: `packed_v2/` stores all cache entries in flat memory-mapped files. Processes share them through the page cache, so each process no longer loads every npz entry. Batch tensors are bitwise equal to the npz loader, in the same order. Run `cache_embeddings.py` once on a cache that has only npz files to build the pack.

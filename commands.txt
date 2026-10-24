@@ -13,7 +13,7 @@ $PY emulator_bench/run_split_benchmarks.py --tasks ki kd ec50 ic50 --gpus 0 1 2 
 # Selected split groups or thresholds
 $PY emulator_bench/run_split_benchmarks.py --tasks ki --split_groups enzyme_sequence_splits substrate_splits --thresholds threshold_0.05
 
-# Cache only (also builds embeddings/packed_v2 from an existing npz-only cache; training needs it)
+# Cache only (parallel build of embeddings/packed_v2; training needs it; --workers sets the processes, default 64)
 $PY emulator_bench/cache_embeddings.py --tasks ki kd ec50 ic50
 
 # Mean and std over seeds (writes summary_runs.csv and summary.csv in the output root)

@@ -21,7 +21,10 @@ The count per split is saved in `run_summary.json` as `rows_dropped_invalid_smil
 SMILES go to RDKit exactly as in the original `code/data_process.py` (whitespace stripped, no canonicalisation).
 The vocabularies follow the original dictionaries: ids are assigned in first-encounter order.
 The original encounters train rows in file order, one dataset at a time. Here the encounter order is the
-sorted unique SMILES and sequences over all four tasks and all default splits (train, val and test).
+sorted unique SMILES and sequences over all four tasks and all seven default split groups (train, val and test).
+`cache_embeddings.py --workers` (default 64) sets the RDKit worker processes. Workers compute the id-free keys.
+The main process assigns the ids in sorted order, so the ids equal a serial pass.
+Each compound is encoded once. The same pass gives the vocabulary and the cache entries.
 The vocabulary is built once, so it does not depend on `--tasks` or on which tasks were cached first.
 
 ## Original settings
@@ -44,6 +47,7 @@ The train loader uses `--num_workers`. The validation and test loaders use at mo
 - `run_split_benchmarks.py`: builds the cache, then runs every seed on every split of every task.
   Finished runs are skipped unless `--overwrite` is set. `--gpus 0 1 --runs_per_gpu 2` runs several trainings at once, one GPU each.
   `--amp` turns on mixed precision (bf16, or fp16 on pre-Ampere GPUs). Default is fp32.
+  The model runs through `torch.compile` by default. `--no_compile` runs it eagerly. `--runs_per_gpu 2` gives the best throughput on an A10.
 - `aggregate_retrain_metrics.py`: writes `summary_runs.csv` and `summary.csv` (mean and std over seeds).
 - `predict_single_target.py`: evaluates a saved `bestmodel.pth` on one split file.
 - `model_v2.py`, `modeling_v2.py`: memory-efficient BACPI. It gives the same outputs as `code/model.py` up to float rounding.
@@ -53,9 +57,9 @@ The train loader uses `--num_workers`. The validation and test loaders use at mo
 
 Default `--out_root`: `outputs/baselines/BACPI`.
 
-- `embeddings/`: feature cache `compounds_v2/`, `proteins_v2/` and the frozen vocabulary `vocabs_v2/`.
-  `packed_v2/` holds the same entries as flat memory-mapped files. Training and prediction read only these files.
-  `cache_embeddings.py` rebuilds `packed_v2/` after it adds entries. It also builds it for a cache that has only npz files, so run it once on such a cache.
+- `embeddings/`: the frozen vocabulary `vocabs_v2/` and `packed_v2/`, flat memory-mapped files of the compound and protein entries.
+  Training and prediction read only `packed_v2/`.
+  A later `cache_embeddings.py` run loads the vocabulary, encodes only the missing entries in parallel and rewrites `packed_v2/` atomically.
   Valid SMILES have entries in `packed_v2/`, so later runs parse only SMILES that are not in it.
   Cache keys cover the featurizer settings. Change `CACHE_VERSION` in `feature_pipeline.py` to force a rebuild.
 - `<task>/<split_group>/<split_name>/seed_<seed>/`: `bestmodel.pth`, `logfile.csv`,
