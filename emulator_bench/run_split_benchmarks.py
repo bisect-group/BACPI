@@ -48,6 +48,7 @@ def main():
     parser.add_argument("--runs_per_gpu", type=int, default=1, help="Concurrent runs per GPU (per --device when --gpus is not set).")
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. Default is fp32.")
+    parser.add_argument("--no_compile", action="store_true", help="Run the model eagerly instead of through torch.compile.")
     parser.add_argument("--skip_smiles_validity_check", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -84,6 +85,8 @@ def main():
                 ]
                 if args.amp:
                     cmd.append("--amp")
+                if args.no_compile:
+                    cmd.append("--no-compile")
                 if args.skip_smiles_validity_check:
                     cmd.append("--skip_smiles_validity_check")
                 commands.append(cmd)

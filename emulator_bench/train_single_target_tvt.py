@@ -46,16 +46,16 @@ def evaluate_loader(model, loader, device, amp_dtype=None):
             batch = move_batch_to_device(batch, device)
             with autocast_context(device, amp_dtype):
                 prediction = forward_batch(model, batch)
-            preds.append(prediction.detach().cpu().float())
-            truths.append(batch["targets"].detach().cpu().float())
-    y_pred = torch.cat(preds).numpy().reshape(-1)
-    y_true = torch.cat(truths).numpy().reshape(-1)
+            preds.append(prediction.float())
+            truths.append(batch["targets"].float())
+    y_pred = torch.cat(preds).cpu().numpy().reshape(-1)
+    y_true = torch.cat(truths).cpu().numpy().reshape(-1)
     return y_true, y_pred, regression_metrics(y_true, y_pred)
 
 
 def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=None):
     model.train()
-    total_loss, total_samples = 0.0, 0
+    total_loss, total_samples = torch.zeros((), dtype=torch.float64, device=device), 0
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
@@ -70,9 +70,9 @@ def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=Non
             scaler.step(optimizer)
             scaler.update()
         n = int(batch["targets"].shape[0])
-        total_loss += float(loss.item()) * n
+        total_loss += loss.detach().double() * n
         total_samples += n
-    return total_loss / max(1, total_samples)
+    return total_loss.item() / max(1, total_samples)
 
 
 def ensure_split_cache(compounds: PackedCache, proteins: PackedCache, frame: pd.DataFrame, smiles_col: str, sequence_col: str):
@@ -138,6 +138,7 @@ def main():
     parser.add_argument("--seed", type=int, default=666)
     parser.add_argument("--skip_smiles_validity_check", action="store_true")
     parser.add_argument("--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. The original code trains in fp32")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True, help="torch.compile the model with dynamic shapes. Same maths, fewer kernel launches")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -176,6 +177,8 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=0, amsgrad=True, fused=device.type == "cuda")
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
 
+    run_model = torch.compile(model, dynamic=True) if args.compile else model
+
     started = time.time()
     best_rmse, best_epoch = float("inf"), 0
     best_path = args.out_dir / "bestmodel.pth"
@@ -183,8 +186,8 @@ def main():
     log_path.unlink(missing_ok=True)
     for epoch in range(1, args.num_epochs + 1):
         row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"]}
-        row["train_loss"] = train_one_epoch(model, loaders["train"], optimizer, device, amp_dtype, scaler)
-        _, _, val_metrics = evaluate_loader(model, loaders["val"], device, amp_dtype)
+        row["train_loss"] = train_one_epoch(run_model, loaders["train"], optimizer, device, amp_dtype, scaler)
+        _, _, val_metrics = evaluate_loader(run_model, loaders["val"], device, amp_dtype)
         row["val_rmse"] = val_metrics["rmse"]
         if val_metrics["rmse"] < best_rmse:
             best_rmse, best_epoch = val_metrics["rmse"], epoch
@@ -197,7 +200,7 @@ def main():
     model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])
     results = {}
     for name in ("train", "val", "test"):
-        y_true, y_pred, metrics = evaluate_loader(model, loaders[name], device, amp_dtype)
+        y_true, y_pred, metrics = evaluate_loader(run_model, loaders[name], device, amp_dtype)
         results[name] = metrics
         pd.DataFrame([metrics]).to_csv(args.out_dir / ("final_results_%s.csv" % name), index=False)
         if name != "train":
