@@ -71,3 +71,20 @@ Random and time splits use `<split_name> = all`.
 ## Commands
 
 See `../commands.txt`. Run the commands from the `baselines/BACPI` folder. Use the mldb conda env: `conda run -n mldb python ...`.
+
+## Verify equivalence
+
+Run `bash emulator_bench/verify_equivalence.sh` from `baselines/BACPI` in the `mldb` conda env. It needs no private data, weights or GPU. The script fails if any test is skipped. Add `--gpu` to also run the GPU tests.
+
+The CPU run builds a small packed cache from 16 synthetic compound and protein rows. It checks:
+
+- `model_v2` against the official `code/model.py` in fp64. Predictions, loss and gradients agree to 1e-10, 1e-10 and 1e-9 (relative), in eval and train mode.
+- `torch.compile` against eager in fp64 (1e-9), and fused Adam against the authors' Adam in fp64 (1e-9).
+- The parallel and incremental cache build against the serial build (bit-exact), and the training loop against a per-batch reference.
+- The wrapper hyperparameters, optimizer and scheduler against `code/main.py`.
+
+The GPU tests check compiled against eager and fused against plain Adam in fp32 (1e-4 and 1e-5). They also compare the production path (fp32, compile, fused Adam; all recorded runs used no `--amp`) with the original eager fp32 path over 12 training steps. A noise control runs the original path again with initial weights perturbed by 1e-6 (relative). The per-step loss gap and the final RMSE gap must stay within 10 times the noise-control gap. Step 0 (the forward before any update) is judged like every other step: its gap must be at most 10 times its floor. The test prints the measured ratio (run with `-s`).
+
+Negative control: `emulator_bench/verify_equivalence.sh --negative-control` scales the weights of the compared (production) run by 1.05 and runs only the GPU tests. It exits 0 only if every GPU test fails, so a passing GPU test shows a bound too loose to catch a 5% error.
+
+Not exact: fp32 kernel fusion in compile and fused Adam. Both change the order of rounding. The original code trains in fp32 without compile. The `--amp` bf16 option is not tested because no run uses it.

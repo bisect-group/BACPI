@@ -2,6 +2,7 @@
 
 import ast
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from emulator_bench.modeling_v2 import BACPIModelConfig, build_model  # noqa: E4
 from emulator_bench.train_single_target_tvt import forward_batch  # noqa: E402
 from test_train_loop import make_batches  # noqa: E402
 
-CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+CUDA = pytest.mark.gpu
 SIZES = [4, 3, 5, 2]  # different shapes per batch exercise dynamic=True
 
 
@@ -25,6 +26,15 @@ def make_model(dtype, device, dropout=0.1):
     torch.manual_seed(0)
     config = BACPIModelConfig(comp_dim=16, prot_dim=16, latent_dim=16, window=2, dropout=dropout)
     return build_model(20, 20, config).to(device=device, dtype=dtype)
+
+
+def negative_control(model):
+    """With EQUIV_NEGATIVE_CONTROL=1 (only the gpu tests run then) the candidate's initial weights are scaled by 1.05: the GPU test must then fail."""
+    if os.environ.get("EQUIV_NEGATIVE_CONTROL") == "1":
+        with torch.no_grad():
+            for p in model.parameters():
+                p.mul_(1.05)
+    return model
 
 
 def to_batches(dtype, device):
@@ -52,7 +62,7 @@ def compare_compiled(dtype, device, rtol, train_mode):
     # dropout is random, so the train-mode check uses dropout 0 and keeps the training code path
     eager = make_model(dtype, device, dropout=0.0 if train_mode else 0.1).train(train_mode)
     model = make_model(dtype, device, dropout=0.0 if train_mode else 0.1).train(train_mode)
-    compiled = torch.compile(model, dynamic=True)
+    compiled = torch.compile(negative_control(model), dynamic=True)
     for batch in to_batches(dtype, device):
         loss_e, grads_e = run(eager, batch)
         loss_c, grads_c = run(compiled, batch)
@@ -81,6 +91,8 @@ def test_compiled_equals_eager_on_gpu_fp32(train_mode):
 
 def adam_trajectory(device, dtype, **kwargs):
     model = make_model(dtype, device, dropout=0.0).train()
+    if kwargs:
+        negative_control(model)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=5e-4, weight_decay=0, amsgrad=True, **kwargs
     )
@@ -176,3 +188,65 @@ def test_wrapper_optimizer_and_scheduler_equal_original():
         10,
         0.5,
     )  # the wrapper defaults are checked above
+
+
+K = 10  # the production gap must stay within 10x the fp32 noise (1e-6 weight perturbation) gap
+
+
+def noise_control_trajectory(variant, device, epochs=3):
+    """Per-step training loss and final eval RMSE of the original path, its noise control or the production path."""
+    from emulator_bench.train_single_target_tvt import evaluate_loader
+
+    model = make_model(torch.float32, device, dropout=0.0)
+    if variant == "production":
+        negative_control(model)
+    if variant == "noise":
+        generator = torch.Generator(device).manual_seed(123)
+        with torch.no_grad():
+            for p in model.parameters():
+                p += 1e-6 * p.abs() * torch.randn(p.shape, generator=generator, device=device)
+    production = variant == "production"
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=0, amsgrad=True, fused=production)
+    run_model = torch.compile(model, dynamic=True) if production else model
+    batches = to_batches(torch.float32, device)
+    losses = []
+    run_model.train()
+    for _ in range(epochs):
+        for batch in batches:
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.mse_loss(forward_batch(run_model, batch), batch["targets"])
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+    _, _, metrics = evaluate_loader(run_model, batches, device)
+    return torch.tensor(losses, dtype=torch.float64), metrics["rmse"]
+
+
+@CUDA
+def test_production_fp32_compiled_fused_within_noise_control():
+    """The production path (fp32, torch.compile, fused Adam; no --amp) against the original eager fp32 path.
+
+    Same model, batches and order for 3 epochs of 4 batches, torch default TF32 settings (cuDNN convolutions use
+    TF32, matmuls do not) as in production, dropout 0. The fp32 noise control perturbs the initial weights by 1e-6
+    (relative). The per-step loss gap and the final RMSE gap must stay within K times the noise gap.
+    Step 0 (forward before any update) is judged like every other step.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = True
+    device = torch.device("cuda")
+    (ref, ref_rmse), (noise, noise_rmse), (prod, prod_rmse) = (
+        noise_control_trajectory(v, device) for v in ("original", "noise", "production")
+    )
+    tiny = 1e-7 * ref.abs().max()
+    gap, floor = (prod - ref).abs(), (noise - ref).abs()
+    final_gap, final_floor = abs(prod_rmse - ref_rmse), abs(noise_rmse - ref_rmse)
+    tiny0 = 1e-7 * ref[0].abs()
+    gap0, floor0 = float(gap[0]), float(floor[0])
+    print(
+        f"bacpi production: max gap={gap.max():.3e}, max floor={floor.max():.3e}, "
+        f"ratio={gap.max() / max(floor.max(), tiny):.2f}, K={K}, step0 gap={gap0:.3e}, floor={floor0:.3e}, ratio={gap0 / max(floor0, tiny0):.2f}, "
+        f"final gap={final_gap:.3e}, final floor={final_floor:.3e}"
+    )
+    assert gap0 <= K * max(floor0, tiny0)
+    assert gap.max() <= K * max(floor.max(), tiny)
+    assert final_gap <= K * max(final_floor, 1e-7 * abs(ref_rmse))
