@@ -1,10 +1,12 @@
 import argparse
 import datetime
 import os
+import random
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -75,6 +77,27 @@ def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=Non
     return total_loss.item() / max(1, total_samples)
 
 
+def save_checkpoint(path: Path, epoch, model, optimizer, scheduler, scaler, best_rmse, best_epoch, train_generator):
+    """Writes everything a resumed run needs to follow the uninterrupted training path."""
+    state = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
+        "best_rmse": best_rmse,
+        "best_epoch": best_epoch,
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+        "train_generator_state": train_generator.get_state(),
+    }
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
 def ensure_split_cache(compounds: PackedCache, proteins: PackedCache, frame: pd.DataFrame, smiles_col: str, sequence_col: str):
     for values, packed, key_fn, kind in (
         (frame[smiles_col].astype(str).unique(), compounds, compound_cache_key, "compound"),
@@ -136,6 +159,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num_workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--seed", type=int, default=666)
+    parser.add_argument("--resume", action="store_true", help="Continue from out_dir/checkpoint_last.pt if it exists")
     parser.add_argument("--skip_smiles_validity_check", action="store_true")
     parser.add_argument("--amp", action="store_true", help="Mixed precision: bf16 on Ampere or newer, fp16 on older GPUs. The original code trains in fp32")
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True, help="torch.compile the model with dynamic shapes. Same maths, fewer kernel launches")
@@ -183,8 +207,32 @@ def main():
     best_rmse, best_epoch = float("inf"), 0
     best_path = args.out_dir / "bestmodel.pth"
     log_path = args.out_dir / "logfile.csv"
-    log_path.unlink(missing_ok=True)
-    for epoch in range(1, args.num_epochs + 1):
+    checkpoint_path = args.out_dir / "checkpoint_last.pt"
+    train_generator = loaders["train"].generator
+    start_epoch = 1
+    if args.resume and checkpoint_path.exists():
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if scaler is not None:
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        best_rmse, best_epoch, start_epoch = checkpoint["best_rmse"], checkpoint["best_epoch"], checkpoint["epoch"] + 1
+        if args.num_workers > 0:
+            # Persistent workers draw a base seed when the iterator is first created: the train loader from its
+            # generator, the val loader from the global RNG. An uninterrupted run drew both in epoch 1.
+            # Draw them now, before the states are restored below.
+            iter(loaders["train"]), iter(loaders["val"])
+        train_generator.set_state(checkpoint["train_generator_state"])
+        torch.set_rng_state(checkpoint["torch_rng"])
+        if checkpoint["cuda_rng"] is not None:
+            torch.cuda.set_rng_state_all(checkpoint["cuda_rng"])
+        np.random.set_state(checkpoint["numpy_rng"])
+        random.setstate(checkpoint["python_rng"])
+        print("Resumed from epoch %s" % checkpoint["epoch"], flush=True)
+    else:
+        log_path.unlink(missing_ok=True)
+    for epoch in range(start_epoch, args.num_epochs + 1):
         row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"]}
         row["train_loss"] = train_one_epoch(run_model, loaders["train"], optimizer, device, amp_dtype, scaler)
         _, _, val_metrics = evaluate_loader(run_model, loaders["val"], device, amp_dtype)
@@ -195,6 +243,7 @@ def main():
         scheduler.step()
         row["elapsed_seconds"] = round(time.time() - started, 3)
         append_csv_row(log_path, row)
+        save_checkpoint(checkpoint_path, epoch, model, optimizer, scheduler, scaler, best_rmse, best_epoch, train_generator)
         print("epoch %s train_loss=%.4f val_rmse=%.4f" % (epoch, row["train_loss"], row["val_rmse"]), flush=True)
 
     model.load_state_dict(torch.load(best_path, map_location=device)["model_state_dict"])

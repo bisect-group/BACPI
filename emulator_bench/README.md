@@ -53,6 +53,12 @@ The train loader uses `--num_workers`. The validation and test loaders use at mo
 - `model_v2.py`, `modeling_v2.py`: memory-efficient BACPI. It gives the same outputs as `code/model.py` up to float rounding.
   The protein convolutions run as banded matrix products (cuDNN above length 8192). Training uses fused Adam on CUDA.
 
+## Resume
+
+Each epoch end writes `out_dir/checkpoint_last.pt` (model, optimizer, scheduler, scaler, best epoch, all RNG states, train loader generator).
+`--resume` continues from it, appends to `logfile.csv` and keeps `bestmodel.pth`. On CPU the resumed run equals an uninterrupted run exactly
+(`tests/test_resume.py`). GPU runs match up to the hardware and the GPU kernels.
+
 ## Output layout
 
 Default `--out_root`: `outputs/baselines/BACPI`.

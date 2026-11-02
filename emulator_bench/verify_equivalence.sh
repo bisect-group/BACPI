@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 echo "Expected conda env: mldb"
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4} MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
 export EMULATOR_SYNTHETIC_FIXTURE=1
-files=(tests/test_official_equivalence.py tests/test_compile_and_fused_adam.py tests/test_cache_build.py tests/test_train_loop.py)
+files=(tests/test_official_equivalence.py tests/test_compile_and_fused_adam.py tests/test_cache_build.py tests/test_train_loop.py tests/test_resume.py)
 if [[ ${1:-} == --negative-control ]]; then
     # Scales the candidate weights by 1.05: every gpu test must fail. A passing gpu test has a vacuous bound.
     export EQUIV_NEGATIVE_CONTROL=1
