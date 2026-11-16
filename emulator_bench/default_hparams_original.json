@@ -1,0 +1,22 @@
+{
+  "model_name": "BACPI",
+  "task": "affinity",
+  "source": "code/main.py argparse defaults; Adam(amsgrad=True, weight_decay=0), MSE loss, StepLR(10, 0.5)",
+  "defaults": {
+    "lr": 0.0005,
+    "step_size": 10,
+    "gamma": 0.5,
+    "batch_size": 16,
+    "num_epochs": 20,
+    "gat_dim": 50,
+    "num_head": 3,
+    "dropout": 0.1,
+    "alpha": 0.1,
+    "comp_dim": 80,
+    "prot_dim": 80,
+    "latent_dim": 80,
+    "window": 5,
+    "layer_cnn": 3,
+    "layer_out": 3
+  }
+}

@@ -1,0 +1,104 @@
+# emulator_bench
+
+Multi-seed evaluation of BACPI with its original settings on the default EMULaToR splits.
+The original `code/` is not changed.
+
+## Tasks and splits
+
+| Task | Split parent |
+|---|---|
+| `ki` | `data/processed/datasets/kinetic_dataset/ki` |
+| `kd`, `ec50`, `ic50` | `data/processed/datasets/binding_affinity_dataset/<task>` |
+
+Split folders per task: `random_splits_grouped_sequence`, `random_splits_grouped_smiles`,
+`uniprot_time_splits`, `enzyme_sequence_splits/threshold_*`, `substrate_splits/threshold_*`.
+Thresholds are read from disk. Each folder needs `train.parquet`, `val.parquet`, `test.parquet`
+with columns `sequence`, `smiles`, `log10_value`.
+
+Split files are never written. Rows with invalid SMILES are dropped in memory only.
+The count per split is saved in `run_summary.json` as `rows_dropped_invalid_smiles`.
+
+SMILES go to RDKit exactly as in the original `code/data_process.py` (whitespace stripped, no canonicalisation).
+The vocabularies follow the original dictionaries: ids are assigned in first-encounter order.
+The original encounters train rows in file order, one dataset at a time. Here the encounter order is the
+sorted unique SMILES and sequences over all four tasks and all seven default split groups (train, val and test).
+`cache_embeddings.py --workers` (default 64) sets the RDKit worker processes. Workers compute the id-free keys.
+The main process assigns the ids in sorted order, so the ids equal a serial pass.
+Each compound is encoded once. The same pass gives the vocabulary and the cache entries.
+The vocabulary is built once, so it does not depend on `--tasks` or on which tasks were cached first.
+
+## Original settings
+
+From `code/main.py`: Adam (`amsgrad=True`, no weight decay), `lr=5e-4`, StepLR (step 10, gamma 0.5),
+batch size 16, 20 epochs, MSE loss, fp32, no early stopping, no gradient clipping.
+The epoch with the lowest validation RMSE gives the test metrics.
+Architecture: `gat_dim=50`, `num_head=3`, `dropout=0.1`, `alpha=0.1`, `comp_dim=prot_dim=latent_dim=80`,
+`window=5`, `layer_cnn=3`, `layer_out=3`.
+Compound features: RDKit graph fingerprint ids and a 1024-bit Morgan fingerprint (radius 2, chirality).
+Protein features: amino-acid 3-grams.
+
+Seeds: 666, 777, 888.
+The train loader uses `--num_workers`. The validation and test loaders use at most 2 workers.
+
+## Scripts
+
+- `cache_embeddings.py`: caches compound and protein features. The paper runs used one cache for Ki, Kd and EC50 and a separate cache for IC50.
+- `train_single_target_tvt.py`: trains one split and one seed.
+- `run_split_benchmarks.py`: builds the cache, then runs every seed on every split of every task.
+  Finished runs are skipped unless `--overwrite` is set. `--gpus 0 1 --runs_per_gpu 2` runs several trainings at once, one GPU each.
+  `--amp` turns on mixed precision (bf16, or fp16 on pre-Ampere GPUs). Default is fp32.
+  The model runs through `torch.compile` by default. `--no_compile` runs it eagerly. `--runs_per_gpu 2` gives the best throughput on an A10.
+- `aggregate_retrain_metrics.py`: writes `summary_runs.csv` and `summary.csv` (mean and std over seeds).
+- `predict_single_target.py`: evaluates a saved `bestmodel.pth` on one split file.
+- `model_v2.py`, `modeling_v2.py`: memory-efficient BACPI. It gives the same outputs as `code/model.py` up to float rounding.
+  The protein convolutions run as banded matrix products (cuDNN above length 8192). Training uses fused Adam on CUDA.
+
+## Resume
+
+Each epoch end writes `out_dir/checkpoint_last.pt` (model, optimizer, scheduler, scaler, best epoch, all RNG states, train loader generator).
+`--resume` continues from it, appends to `logfile.csv` and keeps `bestmodel.pth`. On CPU the resumed run equals an uninterrupted run exactly
+(`tests/test_resume.py`). GPU runs match up to the hardware and the GPU kernels.
+
+## Output layout
+
+Default `--out_root`: `outputs/baselines/BACPI`.
+
+- `embeddings/`: the frozen vocabulary `vocabs_v2/` and `packed_v2/`, flat memory-mapped files of the compound and protein entries.
+  Training and prediction read only `packed_v2/`.
+  A later `cache_embeddings.py` run loads the vocabulary, encodes only the missing entries in parallel and rewrites `packed_v2/` atomically.
+  Valid SMILES have entries in `packed_v2/`, so later runs parse only SMILES that are not in it.
+  Cache keys cover the featurizer settings. Change `CACHE_VERSION` in `feature_pipeline.py` to force a rebuild.
+- `<task>/<split_group>/<split_name>/seed_<seed>/`: `bestmodel.pth`, `logfile.csv`,
+  `final_results_{train,val,test}.csv` (rmse, mae, r2_score, pearson, spearman),
+  `pred_label_{val,test}.csv`, `run_summary.json`
+
+Random and time splits use `<split_name> = all`.
+
+## Commands
+
+See `../commands.txt`. Run the commands from the `baselines/BACPI` folder. Use the mldb conda env.
+
+## Reproduce
+
+`run.sh` runs the whole chain for the paper results: cache, training and the seed summary. It covers Ki, Kd, EC50 and IC50 on all default splits with seeds 666, 777 and 888. It uses fp32 with `torch.compile`, as the paper runs did. Ki, Kd and EC50 share the cache in `embeddings/`. IC50 has its own cache in `embeddings_ic50/`, as in the paper runs. Both caches have the same vocabulary. Set `PY` (we used the `mldb` conda env), `GPUS`, `SEEDS`, `RUNS_PER_GPU`, `DATA_ROOT` and `OUT_ROOT` to change the setup. Run it from any folder. `--dry-run` prints the commands. Train also evaluates and writes the test metrics.
+
+```
+emulator_bench/run.sh [--dry-run] [cache|train|aggregate|all]
+```
+
+## Verify equivalence
+
+Run `bash emulator_bench/verify_equivalence.sh` from `baselines/BACPI` in the `mldb` conda env. It needs no private data, weights or GPU. The script fails if any test is skipped. Add `--gpu` to also run the GPU tests.
+
+The CPU run builds a small packed cache from 16 synthetic compound and protein rows. It checks:
+
+- `model_v2` against the official `code/model.py` in fp64. Predictions, loss and gradients agree to 1e-10, 1e-10 and 1e-9 (relative), in eval and train mode.
+- `torch.compile` against eager in fp64 (1e-9), and fused Adam against the authors' Adam in fp64 (1e-9).
+- The parallel and incremental cache build against the serial build (bit-exact), and the training loop against a per-batch reference.
+- The wrapper hyperparameters, optimizer and scheduler against `code/main.py`.
+
+The GPU tests check compiled against eager and fused against plain Adam in fp32 (1e-4 and 1e-5). They also compare the production path (fp32, compile, fused Adam; all recorded runs used no `--amp`) with the original eager fp32 path over 12 training steps. A noise control runs the original path again with initial weights perturbed by 1e-6 (relative). The per-step loss gap and the final RMSE gap must stay within 10 times the noise-control gap. Step 0 (the forward before any update) is judged like every other step: its gap must be at most 10 times its floor. The test prints the measured ratio (run with `-s`).
+
+Negative control: `emulator_bench/verify_equivalence.sh --negative-control` scales the weights of the compared (production) run by 1.05 and runs only the GPU tests. It exits 0 only if every GPU test fails, so a passing GPU test shows a bound too loose to catch a 5% error.
+
+Not exact: fp32 kernel fusion in compile and fused Adam. Both change the order of rounding. The original code trains in fp32 without compile. The `--amp` bf16 option is not tested because no run uses it.

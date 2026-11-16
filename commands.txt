@@ -1,0 +1,19 @@
+# Paper-run commands for BACPI. emulator_bench/run.sh runs them. Run from baselines/BACPI.
+# PY: python of the conda env (we used mldb). Output default: <EMULaToR>/outputs/baselines/BACPI.
+PY=python
+OUT=../../outputs/baselines/BACPI
+
+# Cache: Ki, Kd, EC50 share embeddings/. IC50 has its own embeddings_ic50/.
+$PY emulator_bench/cache_embeddings.py --tasks ki kd ec50 --embeddings_dir $OUT/embeddings
+$PY emulator_bench/cache_embeddings.py --tasks ic50 --embeddings_dir $OUT/embeddings_ic50
+
+# Train and evaluate: seeds 666 777 888, 20 epochs, fp32, torch.compile (no --amp).
+$PY emulator_bench/run_split_benchmarks.py --tasks ki kd ec50 --gpus 0 --embeddings_dir $OUT/embeddings
+$PY emulator_bench/run_split_benchmarks.py --tasks ic50 --gpus 0 --embeddings_dir $OUT/embeddings_ic50
+
+# Mean and std over seeds (summary_runs.csv, summary.csv).
+$PY emulator_bench/aggregate_retrain_metrics.py
+
+# Evaluate a saved model on one split file.
+$PY emulator_bench/predict_single_target.py --checkpoint <run_dir>/bestmodel.pth \
+    --split_path <split_dir>/test.parquet --embeddings_dir $OUT/embeddings --out_dir <out_dir>
